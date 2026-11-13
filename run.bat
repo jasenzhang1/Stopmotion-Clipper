@@ -16,6 +16,8 @@ if not exist frontend\dist\index.html (
   call npm run build || goto :error
   popd
 )
+rem Stop a copy that's still running (otherwise it keeps serving old code on the same port).
+powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -like '*-m backend.app*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }" >nul 2>&1
 set CLIPPER_OPEN_BROWSER=1
 .venv\Scripts\python -m backend.app
 pause

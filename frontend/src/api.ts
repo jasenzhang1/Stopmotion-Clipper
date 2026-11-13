@@ -11,7 +11,7 @@ export interface Shot {
   stars: number;
   user_stars: number | null;
   hidden: boolean;
-  proxy: { file: string; start: number };
+  proxy: { file: string; start: number; end?: number };
   thumb: string;
   rally_id?: string;
   components: Record<string, number>;
@@ -20,6 +20,10 @@ export interface Shot {
   serve?: { in: boolean; first: boolean; source: "auto" | "user" } | null;
   /** Seconds the user slid the footage (+ = later) so the right frame lands on the beat. */
   nudge?: number | null;
+  /** Permanent name, e.g. F3: letter = kind (F, B, V, A, S), number = this shot's own. */
+  name?: string | null;
+  /** Serves: when the ball is tossed and when it tops out (source seconds). */
+  serve_marks?: ServeMarks | null;
   /** Looks like shots you said weren't real; ranked near the bottom. */
   suspect?: boolean;
   rejected?: string | null;
@@ -39,6 +43,10 @@ export interface Slot {
   label: string | null;
   contact: number;
   lead: number;
+  /** Contact position inside the clip, in sixteenths from its start (on the grid). */
+  hit?: number;
+  /** Free shift of the clip's frame from the grid, in sixteenths (Ctrl+drag). */
+  off?: number;
   start: number;
   end: number;
   shot_id: string;
@@ -99,7 +107,7 @@ export interface Rally {
   n_hits: number;
   duration: number;
   best_start: number;
-  proxy: { file: string; start: number };
+  proxy: { file: string; start: number; end?: number };
 }
 
 export interface Music {
@@ -141,12 +149,32 @@ export interface Project {
   timeline: Timeline | null;
   chat: ChatMsg[];
   exports: ExportRec[];
+  versions?: Version[];
+  can_undo?: boolean;
+  can_redo?: boolean;
   mood: string | null;
   stats?: { videos: number; shots: number; opponent_hits: number; rallies: number; pose_used: boolean };
 }
 
+export interface ServeMarks { toss?: number; apex?: number; source?: "auto" | "user" }
+export type ServeMarksPatch = { detect?: boolean; toss?: number; apex?: number };
+
+/** One contact in a strand: mine (a named, graded shot) or my partner's. */
+export interface StrandHit {
+  t: number; player: "me" | "opp"; shot_id?: string; name?: string | null; type?: ShotType; stars?: number;
+  hidden?: boolean; inferred?: boolean; user?: boolean;
+}
+
+export interface Version { id: string; name: string; time: number }
+
+/** What undo / redo / restoring a version hands back. */
+export interface EditorState {
+  timeline: Timeline | null; mood: string | null; nudges: Record<string, number | null>;
+  can_undo: boolean; can_redo: boolean; versions: Version[];
+}
+
 export interface ProjectSummary {
-  id: string; name: string; created: number; modified: number; last_step: "song" | "shots" | "editor";
+  id: string; name: string; created: number; modified: number; last_step: "song" | "shots" | "editor" | "rally";
   status: string; n_shots: number; n_exports: number;
 }
 
@@ -187,10 +215,12 @@ export const api = {
   list: (path: string) =>
     req<{ path: string; parent: string | null; n_videos: number; entries: { name: string; path: string; kind: "dir" | "video" | "audio" }[] }>(
       "GET", `/api/fs/list?path=${encodeURIComponent(path)}`),
+  status: () => req<{ stale: boolean }>("GET", "/api/status"),
   projects: () => req<ProjectSummary[]>("GET", "/api/projects"),
   create: (b: { name: string; footage_dir: string; song_path: string; handed: string; counts?: Record<string, number> }) =>
     req<Project>("POST", "/api/projects", b),
   project: (id: string) => req<Project>("GET", `/api/projects/${id}`),
+  rename: (id: string, name: string) => req<{ name: string }>("PATCH", `/api/projects/${id}`, { name }),
   job: (id: string) => req<Job>("GET", `/api/jobs/${id}`),
   setStep: (id: string, step: string) => req<{ ok: boolean }>("POST", `/api/projects/${id}/step`, { step }),
   stop: (id: string) => req<{ job: string | null }>("POST", `/api/projects/${id}/stop`),
@@ -200,9 +230,28 @@ export const api = {
     req<Project>("POST", `/api/projects/${id}/section`, b),
   draft: (id: string, b: { mood?: string | null; fresh?: boolean }) => req<Project>("POST", `/api/projects/${id}/draft`, b),
   edit: (id: string, op: string, args: Record<string, unknown>) =>
-    req<{ timeline: Timeline; slot_id?: string }>("POST", `/api/projects/${id}/edit`, { op, args }),
+    req<{ timeline: Timeline; slot_id?: string; slot_ids?: string[] }>("POST", `/api/projects/${id}/edit`, { op, args }),
+  undo: (id: string) => req<EditorState>("POST", `/api/projects/${id}/undo`),
+  redo: (id: string) => req<EditorState>("POST", `/api/projects/${id}/redo`),
+  saveVersion: (id: string, name?: string) => req<EditorState>("POST", `/api/projects/${id}/versions`, { name }),
+  restoreVersion: (id: string, vid: string) => req<EditorState>("POST", `/api/projects/${id}/versions/${vid}/restore`),
+  deleteVersion: (id: string, vid: string) => req<EditorState>("DELETE", `/api/projects/${id}/versions/${vid}`),
+  serveMarks: (id: string, sid: string, b: ServeMarksPatch) =>
+    req<{ serve_marks: ServeMarks | null; proxy: Shot["proxy"]; timeline: Timeline | null }>("POST", `/api/projects/${id}/shots/${sid}/serve_marks`, b),
+  strand: (id: string, sid: string) =>
+    req<{ video_id: string; video: string; hits: StrandHit[]; point_gap: number }>("GET", `/api/projects/${id}/strand?shot=${encodeURIComponent(sid)}`),
+  strandEdit: (id: string, b: { video_id: string; add?: { t: number; player: "me" | "opp" }; remove?: number }) =>
+    req<{ hits: StrandHit[] }>("POST", `/api/projects/${id}/strand/edit`, b),
+  strandPreview: (id: string, video_id: string, t0: number, t1: number) =>
+    req<{ file: string; start: number; end: number }>("POST", `/api/projects/${id}/strand/preview`, { video_id, t0, t1 }),
+  rallyClip: (id: string, video_id: string, t0: number, t1: number) =>
+    req<Project>("POST", `/api/projects/${id}/rally_clip`, { video_id, t0, t1 }),
+  shotWindow: (id: string, sid: string, after: number) =>
+    req<{ proxy: Shot["proxy"]; timeline: Timeline | null }>("POST", `/api/projects/${id}/shots/${sid}/window`, { after }),
+  nudges: (id: string, nudges: Record<string, number>) =>
+    req<{ shots: { id: string; nudge: number }[]; timeline: Timeline | null }>("POST", `/api/projects/${id}/nudges`, { nudges }),
   patchShot: (id: string, sid: string, b: ShotPatch) =>
-    req<Partial<Shot> & { timeline?: Timeline; all?: Pick<Shot, "id" | "stars" | "quality" | "suspect">[] }>("PATCH", `/api/projects/${id}/shots/${sid}`, b),
+    req<Partial<Shot> & { timeline?: Timeline; all?: Pick<Shot, "id" | "stars" | "quality" | "suspect">[]; names?: Record<string, string> }>("PATCH", `/api/projects/${id}/shots/${sid}`, b),
   chat: (id: string, message: string) =>
     req<{ reply: string; timeline: Timeline; chat: ChatMsg[]; shots: Shot[] }>("POST", `/api/projects/${id}/chat`, { message }),
   export: (id: string, b: { resolution: string; hdr: boolean }) => req<{ job: string }>("POST", `/api/projects/${id}/export`, b),
@@ -226,6 +275,9 @@ export const TYPE_LABEL: Record<ShotType, string> = {
 export const typeGroup = (t: ShotType): string =>
   t === "fh_slice" ? "forehand" : t === "bh_slice" ? "backhand"
     : t === "fh_volley" || t === "bh_volley" ? "volley" : t === "overhead" ? "serve" : t;
+
+/** Where a shot's preview clip ends, in source seconds. */
+export const proxyEnd = (s: { t: number; proxy: { start: number; end?: number } }) => s.proxy.end ?? s.t + 2.0;
 
 export const matchFilter = (s: { type: ShotType }, key: string): boolean =>
   key === "all" || (key === "unknown" ? s.type === "unknown"

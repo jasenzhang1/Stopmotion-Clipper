@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import chat as chat_mod, config, draft, learning, music as music_mod, project as proj, render
+from . import media, shots as shots_mod
 
 app = FastAPI(title="Stopmotion Clipper")
 
@@ -24,14 +25,70 @@ def _get(pid: str) -> dict:
         raise HTTPException(404, "Project not found")
 
 
+# ---------------------------------------------------------------- undo / saved versions
+# Undo covers the editor: the timeline, each shot's footage slide (nudge) and the mood. History lives in
+# memory per project (it resets when the app restarts); saved versions are stored in the project file.
+
+_HIST: dict[str, dict] = {}
+UNDO_LIMIT = 100
+
+
+def _snap(p: dict) -> dict:
+    return {"timeline": deepcopy(p.get("timeline")), "mood": p.get("mood"),
+            "nudges": {s["id"]: s["nudge"] for s in p["shots"] if s.get("nudge")}}
+
+
+def _hist(pid: str) -> dict:
+    return _HIST.setdefault(pid, {"undo": [], "redo": [], "kind": None, "t": 0.0})
+
+
+def _record(p: dict, before: dict, kind: str | None = None) -> None:
+    """Remember the state before a change. Quick repeats of the same `kind` (e.g. one slip drag that sends
+    many updates) count as one step."""
+    if before.get("timeline") is None:
+        return
+    h, now = _hist(p["id"]), time.time()
+    if not (kind and h["kind"] == kind and now - h["t"] < 1.5):
+        h["undo"] = (h["undo"] + [before])[-UNDO_LIMIT:]
+    h["redo"], h["kind"], h["t"] = [], kind, now
+
+
+def _restore(p: dict, snap: dict) -> None:
+    p["timeline"], p["mood"] = deepcopy(snap["timeline"]), snap.get("mood")
+    for s in p["shots"]:
+        if snap["nudges"].get(s["id"]):
+            s["nudge"] = snap["nudges"][s["id"]]
+        else:
+            s.pop("nudge", None)
+    if p["timeline"]:
+        p["timeline"] = draft.recompute(p["timeline"], p)
+
+
+def _state(p: dict) -> dict:
+    h = _hist(p["id"])
+    return {"timeline": p.get("timeline"), "mood": p.get("mood"),
+            "nudges": {s["id"]: s.get("nudge") for s in p["shots"]},
+            "can_undo": bool(h["undo"]), "can_redo": bool(h["redo"]), "versions": _versions(p)}
+
+
+def _versions(p: dict) -> list[dict]:
+    return [{"id": v["id"], "name": v["name"], "time": v["time"]} for v in p.get("versions", [])]
+
+
 def _public(p: dict) -> dict:
     """Project without bulky internals the UI doesn't need."""
-    out = {k: v for k, v in p.items() if k not in ("first_draft",)}
+    out = {k: v for k, v in p.items() if k not in ("first_draft", "versions")}
+    out["versions"] = _versions(p)
+    h = _hist(p["id"])
+    out["can_undo"], out["can_redo"] = bool(h["undo"]), bool(h["redo"])
     out["videos"] = [{"id": v["id"], "name": v["name"], "duration": v.get("duration"),
                       "hdr": (v.get("meta") or {}).get("hdr")} for v in p["videos"]]
     out["shots"] = [{k: s.get(k) for k in ("id", "video_id", "t", "type", "auto_type", "quality", "stars",
                                            "user_stars", "hidden", "proxy", "thumb", "rally_id", "components",
-                                           "label_source", "nudge", "suspect", "rejected")} for s in p["shots"] if not s.get("parked")]
+                                           "label_source", "nudge", "suspect", "rejected", "serve_marks")} for s in p["shots"] if not s.get("parked")]
+    names = draft.ensure_names(p, p.get("timeline"))
+    for s in out["shots"]:
+        s["name"] = names.get(s["id"])
     out["rallies"] = [r for r in p.get("rallies", []) if not r.get("parked")]
     out["pool"] = proj.pool_counts(p)
     flags = draft.serve_flags(p) if p.get("shots") else {}
@@ -84,6 +141,22 @@ def fs_list(path: str):
 
 # ---------------------------------------------------------------- meta
 
+_STARTED = time.time()
+
+
+def _stale() -> bool:
+    """True when the backend's code changed after this server started (run.bat needs to be restarted)."""
+    try:
+        return max(f.stat().st_mtime for f in Path(__file__).parent.glob("*.py")) > _STARTED + 1
+    except Exception:
+        return False
+
+
+@app.get("/api/status")
+def status():
+    return {"stale": _stale()}
+
+
 @app.get("/api/meta")
 def meta():
     prefs = learning.load()
@@ -135,13 +208,31 @@ def create_project(body: dict = Body(...)):
 
 @app.get("/api/projects/{pid}")
 def get_project(pid: str):
-    return _public(_get(pid))
+    p = _get(pid)
+    tl = p.get("timeline")
+    if tl and any("hit" not in s for b in tl["bars"] for s in b["slots"]):  # saved before clips sat on the grid
+        with proj.lock(pid):
+            p["timeline"] = draft.recompute(tl, p)
+            proj.save(p)
+    return _public(p)
+
+
+@app.patch("/api/projects/{pid}")
+def rename_project(pid: str, body: dict = Body(...)):
+    p = _get(pid)
+    name = str(body.get("name") or "").strip()[:80]
+    if not name:
+        raise HTTPException(400, "The name can't be empty.")
+    with proj.lock(pid):
+        p["name"] = name
+        proj.save(p)
+    return {"name": name}
 
 
 @app.post("/api/projects/{pid}/step")
 def set_step(pid: str, body: dict = Body(...)):
     p = _get(pid)
-    if body.get("step") in ("song", "shots", "editor") and p.get("last_step") != body["step"]:
+    if body.get("step") in ("song", "shots", "editor", "rally") and p.get("last_step") != body["step"]:
         with proj.lock(pid):
             p["last_step"] = body["step"]
             proj.save(p)
@@ -236,12 +327,14 @@ def make_draft(pid: str, body: dict = Body(default={})):
     if not p["shots"]:
         raise HTTPException(409, "No shots were found in this footage.")
     with proj.lock(pid):
+        before = _snap(p)
         if "mood" in body:
             p["mood"] = body["mood"]
         fresh = bool(body.get("fresh", True))
         _regen(p, body.get("overrides") or {}, keep=not fresh, new_seed=True)
         if fresh or not p.get("first_draft"):
             p["first_draft"] = deepcopy(p["timeline"])
+        _record(p, before)
         proj.save(p)
     return _public(p)
 
@@ -250,8 +343,9 @@ def make_draft(pid: str, body: dict = Body(default={})):
 def edit(pid: str, body: dict = Body(...)):
     p = _get(pid)
     op, a = body.get("op"), body.get("args", {})
-    new_id = None
+    new_id, new_ids = None, None
     with proj.lock(pid):
+        before = _snap(p)
         tl = p.get("timeline")
         if not tl:
             raise HTTPException(409, "Generate a draft first.")
@@ -262,6 +356,12 @@ def edit(pid: str, body: dict = Body(...)):
                 p["timeline"] = draft.swap_slots(tl, p, a["a"], a["b"])
             elif op == "set_bar_density":
                 p["timeline"] = draft.set_bar_density(tl, p, int(a["k"]), int(a["density"]))
+            elif op == "set_hit":
+                p["timeline"] = draft.set_hit(tl, p, a["slot_id"], int(a["hit"]))
+            elif op == "slide_span":
+                p["timeline"], new_id = draft.slide_span(tl, p, a["slot_id"], float(a["start"]))
+            elif op == "resize_left":
+                p["timeline"], new_id = draft.resize_left(tl, p, a["slot_id"], int(a["pos"]))
             elif op == "resize_slot":
                 p["timeline"], new_id = draft.resize_slot(tl, p, a["slot_id"], int(a["len"]))
             elif op == "move_slot":
@@ -276,16 +376,266 @@ def edit(pid: str, body: dict = Body(...)):
                 p["timeline"] = draft.apply_skeleton(tl, p, str(a["text"]))
             elif op == "set_rally":
                 p["timeline"] = draft.set_rally(tl, p, a["rally_id"], a.get("start_hit"))
-            elif op == "unlock_slot":
-                draft._find_slot(tl, a["slot_id"])["locked"] = False
+            elif op in ("unlock_slot", "lock_slot"):
+                draft._find_slot(tl, a["slot_id"])["locked"] = op == "lock_slot"
+            elif op == "move_slots":
+                p["timeline"], new_ids = draft.move_slots(tl, p, list(a["ids"]), int(a["delta"]))
+            elif op == "paste_slots":
+                p["timeline"], new_ids = draft.paste_slots(tl, p, list(a["items"]), int(a["at"]))
+            elif op == "delete_slots":
+                p["timeline"] = draft.delete_slots(tl, p, list(a["ids"]))
             elif op == "regenerate":
                 _regen(p, a.get("overrides") or {}, keep=a.get("keep", True), new_seed=True)
             else:
                 raise HTTPException(400, f"Unknown op {op}")
         except (KeyError, ValueError) as e:
             raise HTTPException(400, str(e))
+        _record(p, before)
         proj.save(p)
-    return {"timeline": p["timeline"], **({"slot_id": new_id} if new_id else {})}
+    return {"timeline": p["timeline"], **({"slot_id": new_id} if new_id else {}),
+            **({"slot_ids": new_ids} if new_ids else {})}
+
+
+@app.post("/api/projects/{pid}/undo")
+def undo(pid: str):
+    p = _get(pid)
+    with proj.lock(pid):
+        h = _hist(pid)
+        if not h["undo"]:
+            raise HTTPException(409, "Nothing to undo.")
+        h["redo"].append(_snap(p))
+        _restore(p, h["undo"].pop())
+        h["kind"] = None
+        proj.save(p)
+        return _state(p)
+
+
+@app.post("/api/projects/{pid}/redo")
+def redo(pid: str):
+    p = _get(pid)
+    with proj.lock(pid):
+        h = _hist(pid)
+        if not h["redo"]:
+            raise HTTPException(409, "Nothing to redo.")
+        h["undo"].append(_snap(p))
+        _restore(p, h["redo"].pop())
+        h["kind"] = None
+        proj.save(p)
+        return _state(p)
+
+
+@app.post("/api/projects/{pid}/versions")
+def save_version(pid: str, body: dict = Body(default={})):
+    p = _get(pid)
+    if not p.get("timeline"):
+        raise HTTPException(409, "Nothing to save yet.")
+    with proj.lock(pid):
+        vs = p.setdefault("versions", [])
+        name = str(body.get("name") or "").strip()[:60] or f"Version {len(vs) + 1}"
+        vs.append({"id": uuid.uuid4().hex[:8], "name": name, "time": time.time(), **_snap(p)})
+        proj.save(p)
+        return _state(p)
+
+
+@app.post("/api/projects/{pid}/versions/{vid}/restore")
+def restore_version(pid: str, vid: str):
+    p = _get(pid)
+    with proj.lock(pid):
+        v = next((v for v in p.get("versions", []) if v["id"] == vid), None)
+        if not v:
+            raise HTTPException(404, "No such version")
+        _record(p, _snap(p))  # restoring can itself be undone
+        _restore(p, v)
+        proj.save(p)
+        return _state(p)
+
+
+@app.delete("/api/projects/{pid}/versions/{vid}")
+def delete_version(pid: str, vid: str):
+    p = _get(pid)
+    with proj.lock(pid):
+        p["versions"] = [v for v in p.get("versions", []) if v["id"] != vid]
+        proj.save(p)
+        return _state(p)
+
+
+# ---------------------------------------------------------------- rally curation ("strands")
+# A strand is every contact in one video, in order: my shots (named, graded) and my partner's hits.
+# You can add contacts the app missed or remove wrong ones; a stretch of it becomes the drop rally.
+
+POINT_GAP = 5.5  # seconds without a hit = the point is over
+
+
+def _strand(p: dict, video_id: str) -> list[dict]:
+    names = draft.ensure_names(p, p.get("timeline"))
+    edits = (p.get("strand_edits") or {}).get(video_id) or {}
+    removed = edits.get("remove") or []
+    gone = lambda t: any(abs(t - r) < 0.05 for r in removed)
+    hits = []
+    for s in p["shots"]:
+        if s["video_id"] != video_id:
+            continue
+        t = s["t"] + (s.get("nudge") or 0)
+        if not gone(t):
+            hits.append({"t": round(t, 4), "player": "me", "shot_id": s["id"], "name": names.get(s["id"]),
+                         "type": s["type"], "stars": s.get("stars"), "hidden": bool(s.get("hidden"))})
+    for r in p.get("rallies", []):
+        if r["video_id"] != video_id or r.get("custom"):
+            continue
+        for h in r["hits"]:
+            if h["player"] == "opp" and not gone(h["t"]) and not any(abs(h["t"] - x["t"]) < 0.3 for x in hits):
+                hits.append({"t": round(h["t"], 4), "player": "opp", "inferred": bool(h.get("inferred"))})
+    for a in edits.get("add") or []:
+        if not gone(a["t"]):
+            hits.append({"t": round(a["t"], 4), "player": a["player"], "user": True})
+    return sorted(hits, key=lambda h: h["t"])
+
+
+@app.get("/api/projects/{pid}/strand")
+def strand(pid: str, shot: str):
+    p = _get(pid)
+    s = next((s for s in p["shots"] if s["id"] == shot), None)
+    if not s:
+        raise HTTPException(404, "No such shot")
+    v = next(v for v in p["videos"] if v["id"] == s["video_id"])
+    return {"video_id": v["id"], "video": v["name"], "hits": _strand(p, v["id"]), "point_gap": POINT_GAP}
+
+
+@app.post("/api/projects/{pid}/strand/edit")
+def strand_edit(pid: str, body: dict = Body(...)):
+    """{"video_id", "add": {"t", "player": "me"|"opp"}} or {"video_id", "remove": t}."""
+    p = _get(pid)
+    vid = body["video_id"]
+    with proj.lock(pid):
+        e = p.setdefault("strand_edits", {}).setdefault(vid, {"add": [], "remove": []})
+        if body.get("add"):
+            a = body["add"]
+            t = float(a["t"])
+            e["remove"] = [r for r in e["remove"] if abs(r - t) >= 0.05]
+            e["add"].append({"t": round(t, 4), "player": "opp" if a.get("player") == "opp" else "me"})
+        if body.get("remove") is not None:
+            t = float(body["remove"])
+            before = len(e["add"])
+            e["add"] = [a for a in e["add"] if abs(a["t"] - t) >= 0.05]
+            if len(e["add"]) == before:  # a detected hit: remember to leave it out
+                e["remove"].append(round(t, 4))
+        proj.save(p)
+    return {"hits": _strand(p, vid)}
+
+
+@app.post("/api/projects/{pid}/strand/preview")
+def strand_preview(pid: str, body: dict = Body(...)):
+    """A playable clip of the strand from t0 to t1 (with a little before and after)."""
+    p = _get(pid)
+    v = next((v for v in p["videos"] if v["id"] == body["video_id"]), None)
+    if not v:
+        raise HTTPException(404, "No such video")
+    a = max(0.0, float(body["t0"]) - 1.0)
+    b = min(v["duration"], float(body["t1"]) + 1.5)
+    rel = f"proxies/strand_{v['id']}_{int(a * 1000)}_{int(b * 1000)}.mp4"
+    out = proj.pdir(pid) / rel
+    if not out.exists():
+        out.parent.mkdir(parents=True, exist_ok=True)
+        media.make_proxy(v["path"], a, b - a, out, v["meta"], config.PROXY_HEIGHT, config.PROXY_FPS)
+    return {"file": rel, "start": a, "end": b}
+
+
+@app.post("/api/projects/{pid}/rally_clip")
+def rally_clip(pid: str, body: dict = Body(...)):
+    """Make the strand from t0 to t1 (first and last contact) the drop rally."""
+    p = _get(pid)
+    vid = body["video_id"]
+    t0, t1 = float(body["t0"]), float(body["t1"])
+    hits = [h for h in _strand(p, vid) if t0 - 0.01 <= h["t"] <= t1 + 0.01]
+    if len(hits) < 2:
+        raise HTTPException(400, "A rally needs at least two contacts.")
+    v = next(v for v in p["videos"] if v["id"] == vid)
+    with proj.lock(pid):
+        r = {"id": f"c{sum(1 for x in p.get('rallies', []) if x.get('custom')) + 1}", "custom": True, "video_id": vid,
+             "hits": [{"t": h["t"], "player": h["player"], "shot_id": h.get("shot_id"), "inferred": False} for h in hits],
+             "start": hits[0]["t"], "point_end": min(v["duration"], hits[-1]["t"] + 0.8), "best_start": 0,
+             "n_hits": len(hits), "parked": False}
+        r["duration"] = round(r["point_end"] - r["start"], 2)
+        q = {s["id"]: s["quality"] for s in p["shots"]}
+        mine = [q[h["shot_id"]] for h in hits if h.get("shot_id") in q]
+        r["score"] = round(sum(mine) / max(1, len(mine)), 4)
+        a = max(0.0, r["start"] - 0.6)
+        b = min(v["duration"], r["point_end"] + 1.5)
+        rel = f"proxies/{r['id']}_{int(a * 1000)}_{int(b * 1000)}.mp4"
+        if not (proj.pdir(pid) / rel).exists():
+            media.make_proxy(v["path"], a, b - a, proj.pdir(pid) / rel, v["meta"], config.PROXY_HEIGHT, config.PROXY_FPS)
+        r["proxy"] = {"file": rel, "start": a}
+        p.setdefault("rallies", []).append(r)
+        if p.get("timeline"):
+            before = _snap(p)
+            p["timeline"] = draft.set_rally(p["timeline"], p, r["id"], 0)
+            _record(p, before)
+        proj.save(p)
+    return _public(p)
+
+
+@app.post("/api/projects/{pid}/shots/{sid}/serve_marks")
+def serve_marks(pid: str, sid: str, body: dict = Body(default={})):
+    """Serves: when the ball is tossed and when it tops out (source seconds).
+    {"detect": true} estimates them from the footage; {"toss": t} / {"apex": t} sets them by hand."""
+    p = _get(pid)
+    s = next((s for s in p["shots"] if s["id"] == sid), None)
+    if not s:
+        raise HTTPException(404, "No such shot")
+    marks = None
+    if body.get("detect"):
+        v = next(v for v in p["videos"] if v["id"] == s["video_id"])
+        try:
+            marks = shots_mod.serve_marks(v["path"], v["meta"], s["t"] + (s.get("nudge") or 0))
+        except Exception as e:
+            raise HTTPException(500, f"Couldn't analyze the serve: {e}")
+    with proj.lock(pid):
+        if body.get("detect"):
+            s["serve_marks"] = {**(marks or {}), "source": "auto", "for": round(s["t"] + (s.get("nudge") or 0), 3)}
+        for k in ("toss", "apex"):
+            if body.get(k) is not None:
+                s.setdefault("serve_marks", {})[k] = round(float(body[k]), 4)
+                s["serve_marks"]["source"] = "user"
+        m = s.get("serve_marks") or {}
+        if m.get("toss") is not None:  # the preview clip has to reach back to the toss
+            proj.ensure_proxy(p, s, m["toss"] - 0.5, proj.proxy_end(s))
+        proj.save(p)
+        return {"serve_marks": s.get("serve_marks"), "proxy": s.get("proxy"), "timeline": p.get("timeline")}
+
+
+@app.post("/api/projects/{pid}/shots/{sid}/window")
+def shot_window(pid: str, sid: str, body: dict = Body(...)):
+    """See more of a shot: make its preview clip run `after` seconds past the contact (max 12)."""
+    p = _get(pid)
+    with proj.lock(pid):
+        s = next((s for s in p["shots"] if s["id"] == sid), None)
+        if not s:
+            raise HTTPException(404, "No such shot")
+        c = s["t"] + (s.get("nudge") or 0)
+        after = max(1.0, min(12.0, float(body.get("after") or 2)))
+        before = max(0.5, min(5.0, float(body.get("before") or 1)))
+        if proj.ensure_proxy(p, s, c - before, c + after):
+            if p.get("timeline"):
+                p["timeline"] = draft.recompute(p["timeline"], p)
+            proj.save(p)
+        return {"proxy": s["proxy"], "timeline": p.get("timeline")}
+
+
+@app.post("/api/projects/{pid}/nudges")
+def nudges(pid: str, body: dict = Body(...)):
+    """Slide several shots' footage at once: {"nudges": {shot_id: seconds}}."""
+    p = _get(pid)
+    with proj.lock(pid):
+        _record(p, _snap(p), "nudge:" + ",".join(sorted(body.get("nudges") or {})))
+        by_id = {s["id"]: s for s in p["shots"]}
+        for sid, v in (body.get("nudges") or {}).items():
+            if sid in by_id:
+                by_id[sid]["nudge"] = _clamp_nudge(p, by_id[sid], float(v or 0))
+        if p.get("timeline"):
+            p["timeline"] = draft.recompute(p["timeline"], p)
+        proj.save(p)
+        return {"shots": [{"id": sid, "nudge": by_id[sid].get("nudge")} for sid in body.get("nudges") or {} if sid in by_id],
+                "timeline": p.get("timeline")}
 
 
 @app.patch("/api/projects/{pid}/shots/{sid}")
@@ -333,13 +683,18 @@ def patch_shot(pid: str, sid: str, body: dict = Body(...)):
             proj.refresh_quality(p, learning.profile(None)["quality_weights"])
         if "serve_in" in body:  # true / false, or null to go back to auto-detection
             s["user_serve_in"] = None if body["serve_in"] is None else bool(body["serve_in"])
-        if "nudge" in body:  # seconds; slides the footage shown around the detected contact
-            s["nudge"] = round(max(-NUDGE_MAX, min(NUDGE_MAX, float(body["nudge"] or 0))), 4)
+        if "nudge" in body:  # seconds; where the ball contact is, relative to the detected hit
+            _record(p, _snap(p), f"nudge:{sid}")
+            _cover_contact(p, s, float(body["nudge"] or 0))
+            s["nudge"] = _clamp_nudge(p, s, float(body["nudge"] or 0))
         if p.get("timeline"):
             p["timeline"] = draft.recompute(p["timeline"], p)
         proj.save(p)
         out = {k: s.get(k) for k in ("id", "type", "stars", "user_stars", "hidden", "quality", "label_source", "nudge",
-                                     "suspect", "rejected")}
+                                     "suspect", "rejected", "proxy")}
+        names = draft.ensure_names(p, p.get("timeline"))
+        out["name"] = names.get(sid)
+        out["names"] = {x["id"]: names[x["id"]] for x in p["shots"] if not x.get("parked")}  # ranks may shift
         if relearn:
             out["all"] = [{k: x.get(k) for k in ("id", "stars", "quality", "suspect")} for x in p["shots"]]
         out["serve"] = draft.serve_flags(p).get(sid)
@@ -348,7 +703,16 @@ def patch_shot(pid: str, sid: str, body: dict = Body(...)):
         return out
 
 
-NUDGE_MAX = 0.75
+def _clamp_nudge(p: dict, s: dict, v: float) -> float:
+    """The contact can be anywhere in the shot's preview clip."""
+    lo, hi = s["proxy"]["start"] - s["t"], proj.proxy_end(s) - s["t"]
+    return round(max(lo, min(hi, v)), 4)
+
+
+def _cover_contact(p: dict, s: dict, nudge: float) -> None:
+    """A contact near the edge of the preview clip: re-cut it so a clip around the contact still fits."""
+    c = s["t"] + nudge
+    proj.ensure_proxy(p, s, c - 1.0, c + config.SHOT_PROXY_WINDOW[1])
 
 
 @app.post("/api/projects/{pid}/chat")
@@ -357,7 +721,10 @@ def chat(pid: str, body: dict = Body(...)):
     if not p.get("timeline"):
         raise HTTPException(409, "Generate a draft first.")
     with proj.lock(pid):
+        before = _snap(p)
         reply = chat_mod.chat(p, body["message"], lambda ov, keep, new: _regen(p, ov, keep, new))
+        if before["timeline"] != p.get("timeline"):
+            _record(p, before)
         proj.save(p)
     return {"reply": reply, "timeline": p["timeline"], "chat": p["chat"],
             "shots": _public(p)["shots"]}

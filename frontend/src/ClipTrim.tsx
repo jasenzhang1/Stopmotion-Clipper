@@ -1,9 +1,9 @@
 import { useState } from "react";
-import { Shot, Slot } from "./api";
+import { proxyEnd, Shot, Slot } from "./api";
 
 export const NUDGE_MAX = 0.75; // must match the backend's limit
 export const FRAME = 1 / 30;
-const POST = 2.0; // preview clips run to 2 s after the detected hit (config.SHOT_PROXY_WINDOW)
+export const POST = 2.0; // preview clips run to 2 s after the detected hit (config.SHOT_PROXY_WINDOW)
 const W = 300;
 
 const sec = (v: number) => `${v >= 0 ? "+" : "−"}${Math.abs(v).toFixed(2)}s`;
@@ -12,8 +12,8 @@ const sec = (v: number) => `${v >= 0 ? "+" : "−"}${Math.abs(v).toFixed(2)}s`;
 export function nudgeBounds(shot: Shot, slot: Slot) {
   const dur = slot.end - slot.start;
   return {
-    min: Math.max(-NUDGE_MAX, shot.proxy.start - shot.t + slot.lead),
-    max: Math.min(NUDGE_MAX, POST - dur + slot.lead),
+    min: shot.proxy.start - shot.t + slot.lead,
+    max: proxyEnd(shot) - shot.t - dur + slot.lead,
   };
 }
 
@@ -21,8 +21,9 @@ export function nudgeBounds(shot: Shot, slot: Slot) {
  * Slip editor for the selected clip. The clip's place on the timeline is locked to the beat, so this
  * slides *which footage* plays inside it: its start and end points move together.
  */
-export default function ClipTrim({ shot, slot, onNudge }: {
-  shot: Shot; slot: Slot; onNudge: (nudge: number) => void;
+export default function ClipTrim({ shot, slot, time, onNudge, onStepFrame, onMarkContact }: {
+  shot: Shot; slot: Slot; time: number; onNudge: (nudge: number) => void;
+  onStepFrame: (d: number) => void; onMarkContact: () => void;
 }) {
   const [drag, setDrag] = useState<number | null>(null);
   const saved = shot.nudge ?? 0;
@@ -37,6 +38,9 @@ export default function ClipTrim({ shot, slot, onNudge }: {
   const src = shot.t + n - slot.lead; // what the backend computes (it clamps the same way)
   const startRel = src - shot.t;
   const endRel = src + dur - shot.t;
+
+  const inClip = time >= slot.start && time < slot.end;
+  const onContact = Math.abs(time - slot.contact) < FRAME / 2;
 
   const onDown = (e: React.PointerEvent) => {
     e.preventDefault();
@@ -65,10 +69,13 @@ export default function ClipTrim({ shot, slot, onNudge }: {
       </span>
       <div className="trim-strip" style={{ width: W }}
         title="Drag the window to choose which moment of the footage plays. The bright line lands on the beat.">
-        <div className="trim-hit" style={{ left: px(shot.t) }} title="Detected hit" />
+        <div className="trim-hit" style={{ left: px(shot.t) }} title="Contact the app detected (from the sound)" />
         <div className="trim-win" style={{ left: px(src), width: Math.max(4, px(src + dur) - px(src)) }} onPointerDown={onDown}>
-          <div className="trim-beat" style={{ left: px(src + slot.lead) - px(src) }} />
+          <div className="trim-beat" style={{ left: px(src + slot.lead) - px(src) }} title="Ball contact: lands on the beat" />
         </div>
+        {time >= slot.start && time < slot.end && (
+          <div className="trim-head" style={{ left: px(src + (time - slot.start)) }} title="Playhead" />
+        )}
       </div>
       <span className="seg">
         <button title="Earlier footage by 0.1s (Shift+,)" disabled={n <= min + 1e-4} onClick={() => step(-0.1)}>«</button>
@@ -77,6 +84,14 @@ export default function ClipTrim({ shot, slot, onNudge }: {
         <button title="Later footage by 0.1s (Shift+.)" disabled={n >= max - 1e-4} onClick={() => step(0.1)}>»</button>
       </span>
       <span className="muted" style={{ minWidth: 64 }}>{Math.abs(n) < 1e-3 ? "" : `nudged ${sec(n)}`}</span>
+      <span className="seg">
+        <button title="Previous frame ([)" onClick={() => onStepFrame(-1)}>◂</button>
+        <button title="Next frame (])" onClick={() => onStepFrame(1)}>▸</button>
+      </span>
+      <button className="contact-btn" disabled={!inClip || onContact} onClick={onMarkContact}
+        title={inClip ? "Make the frame in the preview the ball contact; it moves onto the beat (M or Ctrl+Enter)" : "Move the playhead into this clip first"}>
+        Contact here
+      </button>
       {Math.abs(saved) > 1e-3 && <button onClick={() => onNudge(0)} title="Back to the detected hit">Reset</button>}
     </div>
   );

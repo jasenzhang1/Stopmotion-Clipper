@@ -1,7 +1,7 @@
 import { RefObject, useEffect, useLayoutEffect, useRef } from "react";
 
 /** True when the key press belongs to a text field (so global hotkeys should stay out of the way). */
-function isTyping(el: HTMLElement | null, key: string): boolean {
+export function isTyping(el: HTMLElement | null, key: string): boolean {
   if (!el) return false;
   const erase = key === "Backspace" || key === "Delete"; // means nothing to sliders and dropdowns
   if (el.isContentEditable || el.tagName === "TEXTAREA") return true;

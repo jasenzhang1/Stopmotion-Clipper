@@ -19,7 +19,7 @@ on its beat. Slot ids look like "b-3s2" = bar k=-3 (3 bars before the drop), slo
 point ends. A rally can start mid-way (start_hit) if the latter part is more exciting.
 - Shot types: forehand, backhand, fh_slice, bh_slice (slices count as forehands/backhands, letters F/B), fh_volley, bh_volley, approach, serve, overhead. Stars (1-5) rate how good \
 the shot looks (racket speed, swing size, clean contact, visibility).
-- Every clip has a label like F3 (F forehand, B backhand, V volley, A approach, S serve/overhead). A label names one specific clip across the whole reel: the same label twice means the exact same clip is repeated. Repeat a clip only to make a point (e.g. the music repeats the same note); otherwise keep clips unique.
+- Every clip has a label like F3 (F forehand, B backhand, V volley, A approach, S serve/overhead, U unlabeled). A label names one specific clip across the whole reel: the same label twice means the exact same clip is repeated. Repeat a clip only to make a point (e.g. the music repeats the same note); otherwise keep clips unique.
 - The timeline JSON includes "skeleton": the build-up as text, one line per bar, 4 beat tokens per line. "-" holds the previous clip for that beat, [a b] splits a beat into eighth notes ([a b c d] = sixteenths, only when grid is 16), an unnumbered letter (F) means "any unused forehand", * means any shot, # starts a comment. "." is black (no clip), and "-" after it keeps it black. Clips can start and end on any eighth (any sixteenth on the 16 grid), so dotted lengths are fine. Example bar: "F1 F1 F2 B1", "F3 - [F4 F5] B2" or "F1 . [- B2] B3".
 - "locked" slots were set by hand; regenerate keeps them.
 

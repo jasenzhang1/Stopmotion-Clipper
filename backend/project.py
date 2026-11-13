@@ -82,8 +82,35 @@ def load(pid: str) -> dict:
             f = pdir(pid) / "project.json"
             if not f.exists():
                 raise KeyError(pid)
-            _cache[pid] = json.loads(f.read_text())
+            _cache[pid] = _apply_counts_legacy(json.loads(f.read_text()))
         return _cache[pid]
+
+
+def _apply_counts_legacy(p: dict) -> dict:
+    """Projects analyzed before preview counts existed show every shot. Keep only the best of each kind
+    (plus any shot in the reel or that you rated, relabelled or flagged); the rest wait under "Load more"."""
+    shots = p.get("shots") or []
+    if not shots or any("parked" in s for s in shots):
+        return p
+    tl = p.get("timeline") or {}
+    in_reel = {s["shot_id"] for b in tl.get("bars", []) for s in b["slots"]}
+    rally_id = (tl.get("rally") or {}).get("rally_id")
+    counts = clean_counts(p.get("preview_counts"))
+    for s in shots:
+        s["parked"] = True
+    for g in config.INITIAL_SHOTS:
+        for s in next_best(shots, g, counts[g]):
+            s["parked"] = False
+    for s in shots:
+        if s["id"] in in_reel or s.get("user_stars") or s.get("label_source") == "user" or s.get("complaints"):
+            s["parked"] = False
+    rallies = p.get("rallies") or []
+    if rallies and not any("parked" in r for r in rallies):
+        keep = {r["id"] for r in sorted(rallies, key=lambda r: -r["score"])[:counts["rally"]]} | {rally_id}
+        for r in rallies:
+            r["parked"] = r["id"] not in keep
+    p["preview_counts"] = counts
+    return p
 
 
 def save(p: dict) -> None:
@@ -207,7 +234,7 @@ def make_previews(pid: str, videos: dict[str, dict], shots: list[dict], rallies:
     for s in shots:
         v = videos[s["video_id"]]
         start = max(0.0, s["t"] + pre)
-        s["proxy"] = {"file": f"proxies/{s['id']}.mp4", "start": start}
+        s["proxy"] = {"file": f"proxies/{s['id']}.mp4", "start": start, "end": s["t"] + post}
         s["thumb"] = f"thumbs/{s['id']}.jpg"
         tasks.append(("proxy", v, start, s["t"] + post - start, d / s["proxy"]["file"]))
         tasks.append(("thumb", v, s["t"], 0, d / s["thumb"]))
@@ -232,6 +259,30 @@ def make_previews(pid: str, videos: dict[str, dict], shots: list[dict], rallies:
 
     with ThreadPoolExecutor(max_workers=3) as ex:
         list(ex.map(work, tasks))
+
+
+def proxy_end(s: dict) -> float:
+    """Where a shot's preview clip ends (older projects didn't store it)."""
+    return s["proxy"].get("end", s["t"] + config.SHOT_PROXY_WINDOW[1])
+
+
+def ensure_proxy(p: dict, s: dict, start: float, end: float) -> bool:
+    """Make sure the shot's preview clip covers [start, end] (source seconds), re-cutting a longer one if needed.
+    The clip only grows. Returns True if it was re-cut."""
+    if not s.get("proxy"):
+        return False
+    v = next(v for v in p["videos"] if v["id"] == s["video_id"])
+    start, end = max(0.0, start), min(v.get("duration") or end, end)
+    cur0, cur1 = s["proxy"]["start"], proxy_end(s)
+    if cur0 <= start + 1e-3 and cur1 >= end - 1e-3:
+        return False
+    a, b = min(cur0, start), max(cur1, end)
+    rel = f"proxies/{s['id']}_{int(a * 1000)}_{int(b * 1000)}.mp4"
+    out = pdir(p["id"]) / rel
+    if not out.exists():
+        media.make_proxy(v["path"], a, b - a, out, v["meta"], config.PROXY_HEIGHT, config.PROXY_FPS)
+    s["proxy"] = {"file": rel, "start": a, "end": b}
+    return True
 
 
 def load_more(pid: str, group: str, n: int, progress) -> dict:

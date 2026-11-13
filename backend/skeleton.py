@@ -23,10 +23,10 @@ from .learning import type_group
 
 BAR = 16
 GRIDS = (8, 16)  # finest subdivision per bar: eighths (default) or sixteenths
-LETTER = {"forehand": "F", "backhand": "B", "volley": "V", "approach": "A", "serve": "S"}
+LETTER = {"forehand": "F", "backhand": "B", "volley": "V", "approach": "A", "serve": "S", "unknown": "U"}
 GROUP = {v: k for k, v in LETTER.items()}
-LABEL_RE = re.compile(r"^([FBVAS])(\d+)$")
-CELL_RE = re.compile(r"^(?:([FBVAS])(\d+)?|\*|-|\.)$")
+LABEL_RE = re.compile(r"^([FBVASU])(\d+)$")
+CELL_RE = re.compile(r"^(?:([FBVASU])(\d+)?|\*|-|\.)$")
 GAP = "."
 
 
@@ -34,8 +34,13 @@ class SkeletonError(ValueError):
     pass
 
 
+def group_of(shot: dict) -> str:
+    """Kind for naming and the skeleton: unlabeled shots are their own kind (U)."""
+    return "unknown" if shot["type"] == "unknown" else type_group(shot["type"])
+
+
 def letter_for(shot: dict) -> str:
-    return LETTER.get(type_group(shot["type"]), "F")
+    return LETTER.get(group_of(shot), "F")
 
 
 def unit(grid: int) -> int:

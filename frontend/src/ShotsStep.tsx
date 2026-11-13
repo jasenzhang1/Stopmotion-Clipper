@@ -22,12 +22,14 @@ const TYPES: ShotType[] = ["forehand", "backhand", "fh_slice", "bh_slice", "fh_v
 
 export function useShotUpdater(project: Project, setProject: (p: Project) => void) {
   return async (s: Shot, patch: ShotPatch) => {
-    const { timeline, all, ...upd } = await api.patchShot(project.id, s.id, patch);
+    const { timeline, all, names, ...upd } = await api.patchShot(project.id, s.id, patch);
     const rescored = all && Object.fromEntries(all.map((a) => [a.id, a]));
     setProject({
       ...project,
-      shots: project.shots.map((x) => (x.id === s.id ? { ...x, ...rescored?.[x.id], ...upd } as Shot
-        : rescored?.[x.id] ? { ...x, ...rescored[x.id] } : x)),
+      shots: project.shots.map((x) => {
+        const y = x.id === s.id ? { ...x, ...rescored?.[x.id], ...upd } as Shot : rescored?.[x.id] ? { ...x, ...rescored[x.id] } : x;
+        return names?.[x.id] ? { ...y, name: names[x.id] } : y;
+      }),
       timeline: timeline ?? project.timeline,
     });
   };
@@ -61,7 +63,7 @@ function ShotCard({ project, shot, update }: { project: Project; shot: Shot; upd
       </div>
       <div className="meta">
         <div className="row">
-          <span className={`badge t-${shot.type}`}>{TYPE_CODE[shot.type]}</span>
+          <span className={`badge t-${shot.type}`} title={TYPE_LABEL[shot.type]}>{shot.name ?? TYPE_CODE[shot.type]}</span>
           <Stars value={shot.stars} onChange={(n) => update(shot, { stars: n })} />
           {shot.serve && (
             <span className={`chip serve-chip ${shot.serve.in ? "in" : "out"}`}

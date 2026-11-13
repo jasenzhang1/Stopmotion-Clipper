@@ -1,8 +1,9 @@
 """Timeline generation and editing.
 
-All times in a timeline are *song* times (seconds into the song file). Each build-up slot has a
-contact time on the beat grid; its clip is shown from (contact - lead) until the next slot starts, so
-racket contact always lands exactly on the beat.
+All times in a timeline are *song* times (seconds into the song file). Each build-up slot is a span of the
+grid: it starts at `pos` and lasts `len` (sixteenths), so its cuts are on notes and its length is a whole
+note value. Racket contact is on the grid too, `hit` sixteenths after the start (0 = the clip opens on the
+contact); `lead` = how long it plays before the contact.
 """
 from __future__ import annotations
 
@@ -307,30 +308,37 @@ def recompute(tl: dict, project: dict) -> dict:
                 s["pos"], s["len"] = pos, ln
         b["uniform"] = [(s["pos"], s["len"]) for s in b["slots"]] == sk.uniform(d)
         for s in b["slots"]:
-            s["contact"] = pos_time(b, s["pos"])
-            s["lead"] = lead_for(s["len"] * (b["t1"] - b["t0"]) / sk.BAR)
-    sync_labels(tl, shots)
+            s.pop("lead_user", None)  # older builds: an off-grid lead-in
+            s["off"] = float(s.get("off") or 0.0)  # free shift of the frame (Ctrl+drag), in sixteenths
+            # The contact is a grid line inside the frame [off, off + len] (relative to pos).
+            s["hit"] = int(max(np.ceil(s["off"] - 1e-6), min(s.get("hit") or 0, np.floor(s["off"] + s["len"] + 1e-6))))
+            s["contact"] = pos_time(b, s["pos"] + s["hit"])
+            s["lead"] = s["contact"] - pos_time(b, s["pos"] + s["off"])
+    sync_labels(tl, shots, project)
     prev = None
     for s in slots:
         s["repeat"] = bool(prev and s["shot_id"] == prev)
         prev = s["shot_id"]
-    # The rally's lead-in before the drop can't eat into the last build-up clip's contact.
-    rally_lead = min(RALLY_LEAD, 0.6 * (drop - slots[-1]["contact"])) if slots else RALLY_LEAD
+    # The rally starts an eighth note before the drop (a cut on the grid), unless that would cut off the last
+    # build-up clip's contact.
+    eighth = (tl["bars"][-1]["t1"] - tl["bars"][-1]["t0"]) / 8 if tl["bars"] else RALLY_LEAD
+    rally_lead = eighth if not slots or drop - slots[-1]["contact"] > eighth + 1e-3 else 0.0
     tl["rally_lead"] = rally_lead
     # Absolute grid position (sixteenths from the first bar) tells whether two clips touch or have black between.
     k0 = tl["bars"][0]["k"] if tl["bars"] else 0
     flat = [(b, s) for b in tl["bars"] for s in b["slots"]]
     a_of = lambda b, s: (b["k"] - k0) * sk.BAR + s["pos"]
     total = len(tl["bars"]) * sk.BAR
-    for s in slots:
-        s["start"] = s["contact"] - s["lead"]
+    for b in tl["bars"]:
+        for s in b["slots"]:
+            s["start"] = pos_time(b, s["pos"] + s["off"])
     for i, (b, s) in enumerate(flat):
         a_end = a_of(b, s) + s["len"]
         nxt = flat[i + 1] if i + 1 < len(flat) else None
         limit = nxt[1]["start"] if nxt else drop - rally_lead
         touches = (a_of(*nxt) == a_end) if nxt else a_end >= total
         # Touching clips cut straight into each other; otherwise the clip keeps its own length and black follows.
-        s["end"] = limit if touches else min(limit, pos_time(b, s["pos"] + s["len"]) - s["lead"])
+        s["end"] = min(limit, pos_time(b, s["pos"] + s["off"] + s["len"]))
         s["gap_after"] = not touches
     for s in slots:
         sh = shots.get(s["shot_id"])
@@ -342,7 +350,7 @@ def recompute(tl: dict, project: dict) -> dict:
             lo, hi = 0.0, vdur - dur
             if sh.get("proxy"):  # stay inside the preview clip so the preview shows what will export
                 lo = max(lo, sh["proxy"]["start"])
-                hi = min(hi, sh["t"] + config.SHOT_PROXY_WINDOW[1] - dur)
+                hi = min(hi, sh["proxy"].get("end", sh["t"] + config.SHOT_PROXY_WINDOW[1]) - dur)
             src = float(np.clip(src, lo, max(lo, hi)))
             s["src_start"] = src
             s["video_id"] = sh["video_id"]
@@ -378,7 +386,39 @@ def recompute(tl: dict, project: dict) -> dict:
     return tl
 
 
-def sync_labels(tl: dict, shots: dict[str, dict]) -> None:
+def ensure_names(project: dict, tl: dict | None = None) -> dict[str, str]:
+    """Every shot's name: letter = kind (F, B, V, A, S), number = its rank within that kind by stars (then
+    quality), so F1 is your best forehand. Names follow re-ranking: change a shot's stars and the numbers
+    (and the reel's labels) update. Shots not shown yet are numbered after the shown ones.
+    Returns {shot_id: name}."""
+    project.pop("shot_names", None)  # older builds stored fixed names
+    order = sorted(project.get("shots", []),
+                   key=lambda s: (bool(s.get("parked")), -(s.get("stars") or 0), -s.get("quality", 0), s["id"]))
+    names: dict[str, str] = {}
+    count: dict[str, int] = {}
+    for s in order:
+        L = sk.letter_for(s)
+        count[L] = count.get(L, 0) + 1
+        names[s["id"]] = f"{L}{count[L]}"
+    return names
+
+
+def sync_labels(tl: dict, shots: dict[str, dict], project: dict | None = None) -> None:
+    if project is not None:
+        names = ensure_names(project, tl)
+        used: dict[str, str] = {}
+        for b in tl["bars"]:
+            for s in b["slots"]:
+                lab = names.get(s.get("shot_id")) if s.get("shot_id") in shots else None
+                s["label"] = lab
+                if lab:
+                    used[lab] = s["shot_id"]
+        tl["labels"] = used
+        return
+    _sync_labels_local(tl, shots)
+
+
+def _sync_labels_local(tl: dict, shots: dict[str, dict]) -> None:
     """Give every slot a label (F1, B2, ...) such that same label <=> same shot, across the whole reel.
     Existing labels are kept where still valid; new shots get the next free number for their letter."""
     old: dict[str, str] = tl.get("labels") or {}
@@ -606,9 +646,11 @@ def _overwrite(bar: dict, pos: int, length: int, keep: dict | None = None) -> No
             out.append(s)
         elif s0 < pos:  # starts before: keep its head (a clip landing mid-way cuts off its tail)
             s["len"] = pos - s0
+            s["hit"] = min(s.get("hit") or 0, s["len"])  # the contact stays inside the clip
             out.append(s)
-        elif s1 > end:  # starts inside: its contact moves to where the new clip ends
-            s["pos"], s["len"] = end, s1 - end
+        elif s1 > end:  # starts inside: keep its tail; the contact stays put unless it was cut off
+            s["hit"] = max(0, (s.get("hit") or 0) - (end - s0))
+            s["pos"], s["len"], s["off"] = end, s1 - end, 0.0
             s["locked"] = True
             out.append(s)
         # else: fully covered -> deleted
@@ -657,6 +699,77 @@ def insert_slot(tl: dict, project: dict, k: int, pos: int, length: int, shot_id:
     return recompute(tl, project), new_id
 
 
+def _place(tl: dict, items: list[tuple[int, dict]]) -> list[str]:
+    """Put each (absolute position in sixteenths, slot) on the timeline, overwriting what's there.
+    Items must not overlap each other. Returns their new ids, in order."""
+    bars = tl["bars"]
+    for a, s in items:
+        bi, pos = divmod(a, sk.BAR)
+        if not 0 <= bi < len(bars):
+            raise ValueError("That would go past the end of the build-up.")
+        _check_span(tl, pos, s["len"])
+    for i, (a, s) in enumerate(items):
+        bi, pos = divmod(a, sk.BAR)
+        _overwrite(bars[bi], pos, s["len"])
+        s.update(pos=pos, locked=True, id=f"_g{i}")
+        bars[bi]["slots"].append(s)
+    m = _reid(tl)
+    return [m[f"_g{i}"] for i in range(len(items))]
+
+
+def _abs_slots(tl: dict, ids: list[str]) -> list[tuple[int, dict, dict]]:
+    out = [(bi * sk.BAR + s["pos"], s, b) for bi, b in enumerate(tl["bars"]) for s in b["slots"] if s["id"] in set(ids)]
+    if len(out) != len(set(ids)):
+        raise KeyError("Some of those clips no longer exist.")
+    return sorted(out, key=lambda x: x[0])
+
+
+def move_slots(tl: dict, project: dict, ids: list[str], delta: int) -> tuple[dict, list[str]]:
+    """Move several clips together by `delta` sixteenths (they overwrite what they land on)."""
+    found = _abs_slots(tl, ids)
+    for _, s, b in found:
+        b["slots"].remove(s)
+        b["user_density"] = True
+    new_ids = _place(tl, [(a + delta, s) for a, s, _ in found])
+    return recompute(tl, project), new_ids
+
+
+def _fits(tl: dict, items: list[tuple[int, int]]) -> bool:
+    u = sk.unit(tl.get("grid", 8))
+    n = len(tl["bars"]) * sk.BAR
+    return all(a >= 0 and a + ln <= n and a % u == 0 and (a % sk.BAR) + ln <= sk.BAR for a, ln in items)
+
+
+def paste_slots(tl: dict, project: dict, items: list[dict], at: int) -> tuple[dict, list[str]]:
+    """Paste copied clips ({shot_id, len, off}) starting at the first spot from `at` (sixteenths) where they
+    all fit without crossing a bar line, overwriting what's there."""
+    shot_ids = {s["id"] for s in project["shots"]}
+    items = [{"shot_id": str(i["shot_id"]), "len": int(i["len"]), "off": int(i["off"]),
+              "hit": int(max(0, min(int(i.get("hit") or 0), int(i["len"])))),
+              "shift": float(i.get("shift") or 0.0)} for i in items]
+    if not items or any(i["shot_id"] not in shot_ids for i in items):
+        raise KeyError("Nothing to paste.")
+    u = sk.unit(tl.get("grid", 8))
+    start = -(-at // u) * u
+    n = len(tl["bars"]) * sk.BAR
+    while start < n and not _fits(tl, [(start + i["off"], i["len"]) for i in items]):
+        start += u
+    if start >= n:
+        raise ValueError("No room after the selection to paste into.")
+    slots = [(start + i["off"], {"len": i["len"], "shot_id": i["shot_id"], "hit": i["hit"], "off": i["shift"], "repeat": False})
+             for i in items]
+    new_ids = _place(tl, slots)
+    return recompute(tl, project), new_ids
+
+
+def delete_slots(tl: dict, project: dict, ids: list[str]) -> dict:
+    for _, s, b in _abs_slots(tl, ids):
+        b["slots"].remove(s)
+        b["user_density"] = True
+    _reid(tl)
+    return recompute(tl, project)
+
+
 def delete_slot(tl: dict, project: dict, slot_id: str) -> dict:
     """Remove a clip, leaving black where it was."""
     bar = _bar_of(tl, slot_id)
@@ -666,11 +779,71 @@ def delete_slot(tl: dict, project: dict, slot_id: str) -> dict:
     return recompute(tl, project)
 
 
+def set_hit(tl: dict, project: dict, slot_id: str, hit: int) -> dict:
+    """Move only the contact inside a clip: to grid line `pos + hit`. The clip's frame stays put; its footage
+    re-aligns so the contact frame lands on the new beat."""
+    bar = _bar_of(tl, slot_id)
+    slot = next(s for s in bar["slots"] if s["id"] == slot_id)
+    u = sk.unit(tl.get("grid", 8))
+    off = float(slot.get("off") or 0.0)
+    lo, hi = int(np.ceil((off - 1e-6) / u) * u), int(np.floor((off + slot["len"] + 1e-6) / u) * u)
+    slot["hit"] = int(max(lo, min(hi, round(int(hit) / u) * u)))
+    slot["locked"] = True
+    return recompute(tl, project)
+
+
+def slide_span(tl: dict, project: dict, slot_id: str, start: float) -> tuple[dict, str]:
+    """Ctrl+drag: slide a clip's frame so it starts at `start` (sixteenths into its bar, any value) while its
+    contact stays on the same beat: right = the contact nears the clip's start, left = its end. The frame's
+    grid footprint (for overwriting neighbours) is the nearest grid position."""
+    bar = _bar_of(tl, slot_id)
+    slot = next(s for s in bar["slots"] if s["id"] == slot_id)
+    contact = slot["pos"] + (slot.get("hit") or 0)
+    start = float(max(contact - slot["len"], min(contact, start)))
+    u = sk.unit(tl.get("grid", 8))
+    L = slot["len"]
+    others = [o for o in bar["slots"] if o is not slot]
+    # Grid footprint: the grid position nearest the frame's real start that doesn't overlap a neighbour, so
+    # sliding up against a clip (or snapping to it) never trims it. Only a real overlap overwrites.
+    cands = [p for p in range(0, sk.BAR - L + 1, u) if contact - L <= p <= contact]
+    free = [p for p in cands if all(p + L <= o["pos"] or p >= o["pos"] + o["len"] for o in others)]
+    vis = lambda o: (o["pos"] + (o.get("off") or 0), o["pos"] + (o.get("off") or 0) + o["len"])
+    overlaps = any(min(start + L, vis(o)[1]) - max(start, vis(o)[0]) > 1e-3 for o in others)
+    pick = free if (free and not overlaps) else cands
+    if not pick:
+        raise ValueError("That clip can't slide there.")
+    pos = min(pick, key=lambda p: (abs(p - start), p))
+    bar["slots"].remove(slot)
+    if overlaps or pos not in free:
+        _overwrite(bar, pos, L)
+    slot["pos"], slot["hit"], slot["off"], slot["locked"] = pos, contact - pos, round(start - pos, 4), True
+    bar["slots"].append(slot)
+    slot["id"] = "_slid"
+    new_id = _reid(tl)["_slid"]
+    return recompute(tl, project), new_id
+
+def resize_left(tl: dict, project: dict, slot_id: str, pos: int) -> tuple[dict, str]:
+    """Move a clip's left edge to grid position `pos` in its bar: earlier shows more before the contact
+    (overwriting what's there), later shows less. The contact and the right edge stay put."""
+    bar = _bar_of(tl, slot_id)
+    slot = next(s for s in bar["slots"] if s["id"] == slot_id)
+    contact, end = slot["pos"] + (slot.get("hit") or 0), slot["pos"] + slot["len"]
+    pos = int(max(0, min(pos, contact)))
+    _check_span(tl, pos, end - pos)
+    if pos < slot["pos"]:
+        _overwrite(bar, pos, slot["pos"] - pos, keep=slot)
+    slot["pos"], slot["len"], slot["hit"], slot["off"], slot["locked"] = pos, end - pos, contact - pos, 0.0, True
+    slot["id"] = "_resized"
+    new_id = _reid(tl)["_resized"]
+    return recompute(tl, project), new_id
+
+
 def resize_slot(tl: dict, project: dict, slot_id: str, length: int) -> tuple[dict, str]:
     """Make a clip `length` sixteenths long. Growing overwrites what it runs into; shrinking leaves black.
     Returns (timeline, the clip's new id)."""
     bar = _bar_of(tl, slot_id)
     slot = next(s for s in bar["slots"] if s["id"] == slot_id)
+    length = max(length, slot.get("hit") or 0, sk.unit(tl.get("grid", 8)))  # keep the contact inside
     _check_span(tl, slot["pos"], length)
     _overwrite(bar, slot["pos"], length, keep=slot)
     slot["len"], slot["locked"] = length, True
@@ -697,7 +870,8 @@ def apply_skeleton(tl: dict, project: dict, text: str) -> dict:
     clip; new numbers and unnumbered letters get the best unused clip of that type."""
     specs = sk.parse(text, len(tl["bars"]), tl.get("grid", 8))
     shots = {s["id"]: s for s in project["shots"]}
-    labels = tl.get("labels") or {}
+    # A numbered label names a shot: its own name (F7 = the library's F7), or a name the reel used before.
+    labels = {**(tl.get("labels") or {}), **{n: sid for sid, n in ensure_names(project, tl).items()}}
     exclude = _rally_shots(tl, project)
     bind: dict[str, str] = {}
     for bar_specs in specs:
@@ -717,10 +891,10 @@ def apply_skeleton(tl: dict, project: dict, text: str) -> dict:
                 sp["shot_id"] = bind[sp["label"]]
                 continue
             g = sp["group"]
-            pick = next((s for s in pool if s["id"] not in used and (g == "*" or type_group(s["type"]) == g)
+            pick = next((s for s in pool if s["id"] not in used and (g == "*" or sk.group_of(s) == g)
                          and fits_slot(s, sp["len"], flags)), None)
             if pick is None:
-                have = sum(1 for s in pool if (g == "*" or type_group(s["type"]) == g) and fits_slot(s, sp["len"], flags))
+                have = sum(1 for s in pool if (g == "*" or sk.group_of(s) == g) and fits_slot(s, sp["len"], flags))
                 name = "shots" if g == "*" else f"{g} clips"
                 example = sp["label"] or (sk.LETTER.get(g, "F") + "1")
                 hint = (" Serves that didn't go in only fit quarter notes or shorter; name one (e.g. S2) to use it "

@@ -100,17 +100,22 @@ export default function SongStep({ project, onSaved, onNext, ready }: {
     return Math.max(0, Math.min(m.duration, (e.clientX - r.left) / pps));
   };
 
+  const [cursor, setCursor] = useState("pointer");
+  const markerAt = (t: number) => {
+    const near = (x: number) => Math.abs(x - t) * pps < 8;
+    return locked ? null : near(drop) ? "drop" : near(start) ? "start" : near(end) ? "end" : null;
+  };
   const onDown = (e: React.MouseEvent) => {
     const t = timeAt(e);
-    const near = (x: number) => Math.abs(x - t) * pps < 8;
-    drag.current = locked ? null : near(drop) ? "drop" : near(start) ? "start" : near(end) ? "end" : null;
+    drag.current = markerAt(t);
+    if (drag.current) setCursor("grabbing");
     if (!drag.current) {
       setHead(t);
       if (audio.current) audio.current.currentTime = t;
     }
   };
   const onMove = (e: React.MouseEvent) => {
-    if (!drag.current) return;
+    if (!drag.current) { setCursor(markerAt(timeAt(e)) ? "grab" : "pointer"); return; }
     const t = snap(timeAt(e));
     if (drag.current === "start") setStart(Math.min(t, drop - 4 * m.period));
     if (drag.current === "drop") setDrop(Math.max(t, start + 4 * m.period));
@@ -229,8 +234,8 @@ export default function SongStep({ project, onSaved, onNext, ready }: {
         {stat("Tempo", `${m.bpm.toFixed(1)} BPM`, `${(m.period * 1000).toFixed(0)} ms per beat`)}
       </div>
       <div className={`wave-wrap ${locked ? "locked" : ""}`} ref={wrap}>
-        <canvas ref={canvas} style={{ height: H, width: Math.ceil(m.duration * pps) }} onMouseDown={onDown} onMouseMove={onMove}
-          onMouseUp={() => (drag.current = null)} onMouseLeave={() => (drag.current = null)} />
+        <canvas ref={canvas} style={{ cursor: locked ? "default" : cursor, height: H, width: Math.ceil(m.duration * pps) }} onMouseDown={onDown} onMouseMove={onMove}
+          onMouseUp={(e) => { drag.current = null; onMove(e); }} onMouseLeave={() => { drag.current = null; setCursor("pointer"); }} />
       </div>
       <div className="row">
         <button onClick={() => play()}>{playing ? "⏸ Pause" : "▶ Play from playhead"}</button>

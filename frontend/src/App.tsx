@@ -5,12 +5,33 @@ import SongStep from "./SongStep";
 import ShotsStep from "./ShotsStep";
 import Editor from "./Editor";
 import ProgressBar from "./Progress";
+import RallyStep from "./RallyStep";
 
-type Step = "song" | "shots" | "editor";
+type Step = "song" | "shots" | "editor" | "rally";
 
 function readHash(): { pid: string | null; step: Step } {
-  const m = location.hash.match(/^#\/p\/([^/]+)(?:\/(song|shots|editor))?/);
+  const m = location.hash.match(/^#\/p\/([^/]+)(?:\/(song|shots|editor|rally))?/);
   return m ? { pid: m[1], step: (m[2] as Step) || "song" } : { pid: null, step: "song" };
+}
+
+/** The project's name in the top bar; click it to rename. */
+function ProjectName({ name, onRename }: { name: string; onRename: (name: string) => void }) {
+  const [draft, setDraft] = useState<string | null>(null);
+  if (draft === null) {
+    return <strong className="project-name" title="Click to rename" onClick={() => setDraft(name)}>{name}</strong>;
+  }
+  const done = (save: boolean) => {
+    const v = draft.trim();
+    setDraft(null);
+    if (save && v && v !== name) onRename(v);
+  };
+  return (
+    <input type="text" className="project-name-input" value={draft} autoFocus maxLength={80}
+      onFocus={(e) => e.currentTarget.select()}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={() => done(true)}
+      onKeyDown={(e) => { if (e.key === "Enter") done(true); if (e.key === "Escape") done(false); }} />
+  );
 }
 
 export default function App() {
@@ -22,6 +43,14 @@ export default function App() {
   const [stopping, setStopping] = useState(false);
   const [runs, setRuns] = useState(0); // bumped to follow a newly started analysis job
   const [savedAt, setSavedAt] = useState(0);
+  // The backend changed since the server started: tell the user to restart run.bat (checked every 20 s).
+  const [stale, setStale] = useState(false);
+  useEffect(() => {
+    const check = () => api.status().then((r) => setStale(r.stale)).catch(() => {});
+    check();
+    const id = setInterval(check, 20000);
+    return () => clearInterval(id);
+  }, []);
 
   useEffect(() => {
     api.meta().then(setMeta).catch((e) => setErr(String(e)));
@@ -119,16 +148,21 @@ export default function App() {
         {p && (
           <>
             <span className="muted">/</span>
-            <strong>{p.name}</strong>
+            <ProjectName name={p.name} onRename={async (name) => {
+              try { const r = await api.rename(p.id, name); setProject({ ...p, name: r.name }); }
+              catch (e) { setErr(String(e)); }
+            }} />
             <div className="steps">
               <button className={route.step === "song" ? "active" : ""} onClick={() => go(p.id, "song")}>1 · Song</button>
               <button className={route.step === "shots" ? "active" : ""} disabled={!ready} onClick={() => go(p.id, "shots")}>2 · Shots</button>
               <button className={route.step === "editor" ? "active" : ""} disabled={!ready} onClick={() => go(p.id, "editor")}>3 · Editor</button>
+              <button className={route.step === "rally" ? "active" : ""} disabled={!ready} onClick={() => go(p.id, "rally")}>4 · Rally</button>
             </div>
           </>
         )}
         <div className="spacer" />
         {p && savedAt > 0 && <span className="muted">Saved</span>}
+        {stale && <span className="error" title="The app was updated. Close the run.bat window and double-click run.bat again.">⚠ Restart run.bat to load the latest changes</span>}
         {err && <span className="error" onClick={() => setErr(null)} title="Dismiss">{err}</span>}
       </div>
       {job && job.status === "running" && (
@@ -157,6 +191,9 @@ export default function App() {
         )}
         {p && ready && route.step === "shots" && (
           <ShotsStep project={p} setProject={setProject} onNext={() => go(p.id, "editor")} />
+        )}
+        {p && ready && route.step === "rally" && (
+          <RallyStep project={p} setProject={setProject} onDone={() => go(p.id, "editor")} />
         )}
         {p && ready && route.step === "editor" && meta && (
           <Editor project={p} setProject={setProject} meta={meta} />

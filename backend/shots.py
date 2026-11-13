@@ -483,3 +483,71 @@ def stars_from_quality(q: list[float]) -> list[int]:
         return []
     p = _pct(np.array(q))
     return [int(np.clip(1 + np.floor(x * 5), 1, 5)) for x in p]
+
+
+# ---------------------------------------------------------------- serve toss / ball apex
+
+G = 9.81
+NOSE_TO_ANKLE_M = 1.55  # typical adult nose-to-ankle height, to turn pixels into metres
+RACKET_REACH_M = 0.55   # contact point above the hitting wrist
+
+
+def serve_marks(video_path: str, meta: dict, contact_t: float) -> dict | None:
+    """Estimate when the ball is tossed (leaves the hand) and when it reaches the top of its arc.
+
+    The pose model sees the body, not the ball, so: the toss is when the tossing hand is at its highest
+    (arm fully extended, the ball leaves it); the apex follows from projectile motion between the
+    release height and the contact height (hitting wrist + racket) over the time between them.
+    Returns {"toss": t, "apex": t} in source seconds, or None if the player can't be seen."""
+    fps = 30
+    start = max(0.0, contact_t - 2.6)
+    frames = media.read_frames(video_path, start, contact_t + 0.1 - start, fps, config.POSE_HEIGHT, meta)
+    if not len(frames):
+        return None
+    track: list[Person | None] = []
+    prev = None
+    for ppl in run_pose(frames):
+        near, _ = pick_players(ppl, config.POSE_HEIGHT, prev)
+        track.append(near)
+        if near is not None:
+            prev = near
+    times = start + np.arange(len(track)) / fps
+    # Scale (metres per pixel) and ground line from nose / ankles.
+    spans, grounds = [], []
+    for p in track:
+        if p is None:
+            continue
+        ank = p.kp[[L_ANK, R_ANK]]
+        ok = ank[:, 2] > 0.3
+        if ok.any() and p.kp[NOSE, 2] > 0.3:
+            g = float(ank[ok, 1].max())
+            spans.append(g - float(p.kp[NOSE, 1]))
+            grounds.append(g)
+    if len(spans) < 5:
+        return None
+    m_per_px = NOSE_TO_ANKLE_M / max(1.0, float(np.median(spans)))
+    ground = float(np.median(grounds))
+    # Highest wrist per frame, in metres above the ground.
+    top = np.full(len(track), np.nan)
+    for i, p in enumerate(track):
+        if p is None:
+            continue
+        w = _wrists(p)
+        ok = w[:, 2] > 0.3
+        if ok.any():
+            top[i] = (ground - float(w[ok, 1].min())) * m_per_px
+    if np.isnan(top).all():
+        return None
+    win = (times >= contact_t - 2.4) & (times <= contact_t - 0.3) & ~np.isnan(top)
+    if not win.any():
+        return None
+    i_toss = int(np.flatnonzero(win)[np.argmax(top[win])])
+    t_toss = float(times[i_toss])
+    h_release = float(top[i_toss]) + 0.08  # ball sits a little above the wrist
+    near_c = (np.abs(times - contact_t) <= 0.1) & ~np.isnan(top)
+    h_contact = (float(np.nanmax(top[near_c])) if near_c.any() else h_release + 0.6) + RACKET_REACH_M
+    T = contact_t - t_toss
+    v0 = (h_contact - h_release + 0.5 * G * T * T) / T
+    t_apex = t_toss + max(0.0, v0) / G
+    t_apex = float(np.clip(t_apex, t_toss + 0.1, contact_t - 0.03))
+    return {"toss": round(t_toss, 4), "apex": round(t_apex, 4)}

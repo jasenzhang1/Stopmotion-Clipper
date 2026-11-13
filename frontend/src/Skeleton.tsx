@@ -37,7 +37,7 @@ export function SkeletonDialog({ timeline, onClose, onApply }: {
             <p><b>One line = one bar</b>, four beats per line.</p>
             <table>
               <tbody>
-                <tr><td><code>F B V A S</code></td><td>forehand, backhand, volley, approach, serve/overhead</td></tr>
+                <tr><td><code>F B V A S U</code></td><td>forehand, backhand, volley, approach, serve/overhead, unlabeled</td></tr>
                 <tr><td><code>F3</code></td><td>one specific clip. Same label = the exact same clip, anywhere in the reel</td></tr>
                 <tr><td><code>F</code></td><td>any forehand not used yet</td></tr>
                 <tr><td><code>*</code></td><td>any shot</td></tr>
