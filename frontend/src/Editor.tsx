@@ -3,8 +3,8 @@ import { api, EditorState, fileUrl, matchFilter, Meta, Project, ServeMarksPatch,
 import Preview from "./Preview";
 import { isTyping, useHotkeys } from "./hotkeys";
 import { FRAME, nudgeBounds } from "./ClipTrim";
-import Timeline from "./Timeline";
-import { ExportDialog, RallyPicker } from "./Dialogs";
+import Timeline, { contactPct, groupSlideRange } from "./Timeline";
+import { ExportDialog } from "./Dialogs";
 import { SkeletonDialog } from "./Skeleton";
 import { FILTERS, Stars, useShotUpdater } from "./ShotsStep";
 
@@ -54,7 +54,7 @@ function Chat({ project, onResult, available }: {
   const [busy, setBusy] = useState(false);
   const [pending, setPending] = useState<string | null>(null);
   const end = useRef<HTMLDivElement>(null);
-  useEffect(() => end.current?.scrollIntoView({ behavior: "smooth" }), [project.chat.length, pending]);
+  useEffect(() => { end.current?.scrollIntoView({ behavior: "smooth" }); }, [project.chat.length, pending]);
 
   const send = async () => {
     const msg = text.trim();
@@ -79,7 +79,7 @@ function Chat({ project, onResult, available }: {
         {!project.chat.length && !pending && (
           <div className="msg assistant">
             Here's your first draft. Tell me what to change, e.g. "more backhands in the build-up",
-            "make bar -3 eighth notes", or "pick a longer rally for the drop".
+            "make bar -3 eighth notes", or "more backhands near the drop".
             {!available && <div className="error" style={{ marginTop: 6 }}>No Anthropic API key found. Set ANTHROPIC_API_KEY and restart to use chat.</div>}
           </div>
         )}
@@ -96,8 +96,16 @@ function Chat({ project, onResult, available }: {
   );
 }
 
-export default function Editor({ project, setProject, meta }: {
+/** The project after an edit: the new timeline, plus any longer preview clips cut for long clips. */
+const withEdit = (p: Project, r: { timeline: Project["timeline"]; proxies?: Record<string, Shot["proxy"]> }): Project => ({
+  ...p, timeline: r.timeline,
+  shots: r.proxies ? p.shots.map((s) => (r.proxies![s.id] ? { ...s, proxy: r.proxies![s.id] } : s)) : p.shots,
+});
+
+export default function Editor({ project, setProject, meta, exportReq }: {
   project: Project; setProject: (p: Project) => void; meta: Meta;
+  /** Bumped when Export is pressed in the top bar: open the export dialog. */
+  exportReq?: number;
 }) {
   const [time, setTime] = useState(project.timeline?.reel_start ?? 0);
   const [playing, setPlaying] = useState(false);
@@ -112,7 +120,8 @@ export default function Editor({ project, setProject, meta }: {
     setInspectId(id);
   };
   useEffect(() => { if (playing || selected) setInspectId(null); }, [playing, selected]);
-  const clipboard = useRef<{ shot_id: string; len: number; off: number; hit: number; shift: number }[]>([]);
+  /** Copied clips as they play on screen, in seconds: start relative to the first, length, contact after start. */
+  const clipboard = useRef<{ shot_id: string; off: number; dur: number; lead: number }[]>([]);
   // Undo / redo / saved versions
   const [hist, setHist] = useState({ undo: !!project.can_undo, redo: !!project.can_redo });
   const [versionsOpen, setVersionsOpen] = useState(false);
@@ -164,8 +173,15 @@ export default function Editor({ project, setProject, meta }: {
   }, []);
 
   const [copied, setCopied] = useState<{ n: number; label: string | null; at: number } | null>(null);
-  const [rallyOpen, setRallyOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
+  const seenExport = useRef(0);
+  useEffect(() => {
+    if (exportReq && exportReq !== seenExport.current && project.timeline) {
+      seenExport.current = exportReq;
+      setPlaying(false);
+      setExportOpen(true);
+    }
+  }, [exportReq, project.timeline]);
   const [skeletonOpen, setSkeletonOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -197,7 +213,7 @@ export default function Editor({ project, setProject, meta }: {
     setErr(null);
     try {
       const r = await api.edit(project.id, op, args);
-      setProject({ ...project, timeline: r.timeline });
+      setProject(withEdit(project, r));
       if (op === "paste_slots" && r.slot_ids?.length) { // playhead onto the pasted clip, so Ctrl+V again chains on
         const last = r.timeline.bars.flatMap((b) => b.slots).find((s) => s.id === r.slot_ids![r.slot_ids!.length - 1]);
         if (last) { setPlaying(false); setTime(last.contact); }
@@ -219,7 +235,7 @@ export default function Editor({ project, setProject, meta }: {
   const applySkeleton = async (text: string): Promise<string | null> => {
     try {
       const r = await api.edit(project.id, "apply_skeleton", { text });
-      setProject({ ...project, timeline: r.timeline });
+      setProject(withEdit(project, r));
       return null;
     } catch (e: any) {
       return e.message;
@@ -291,7 +307,7 @@ export default function Editor({ project, setProject, meta }: {
     const sh = s && project.shots.find((x) => x.id === s.shot_id);
     if (!s || !sh || time < s.start || time >= s.end) return false;
     const frame = s.src_start + (time - s.start);
-    const { min, max } = nudgeBounds(sh, s);
+    const { min, max } = nudgeBounds(sh, s, project.videos.find((v) => v.id === sh.video_id)?.duration);
     const v = Math.round(Math.max(min, Math.min(max, frame - sh.t)) / FRAME) * FRAME;
     nudge(sh.id, v).then(() => { setPlaying(false); setTime(s.contact); });
     return true;
@@ -302,10 +318,10 @@ export default function Editor({ project, setProject, meta }: {
     setErr(null);
     try {
       const r = await api.nudges(project.id, values);
-      const by = Object.fromEntries(r.shots.map((s) => [s.id, s.nudge]));
+      const by = Object.fromEntries(r.shots.map((s) => [s.id, s]));
       setProject({
         ...project,
-        shots: project.shots.map((x) => (x.id in by ? { ...x, nudge: by[x.id] } : x)),
+        shots: project.shots.map((x) => (x.id in by ? { ...x, nudge: by[x.id].nudge, proxy: by[x.id].proxy ?? x.proxy } : x)),
         timeline: r.timeline ?? project.timeline,
       });
     } catch (e: any) {
@@ -320,31 +336,53 @@ export default function Editor({ project, setProject, meta }: {
     return s ? { a: bi * 16 + s.pos, s } : null;
   };
   const copyRef = useRef<(e: KeyboardEvent) => void>(() => {});
+  const sliding = useRef(false); // a Ctrl+arrow slide is waiting on the server
   copyRef.current = (e: KeyboardEvent) => {
     if (!tl || !(e.ctrlKey || e.metaKey) || e.altKey || isTyping(e.target as HTMLElement, e.key)) return;
     const k = e.key.toLowerCase();
     if (k === "enter") { if (!inspectId && markContact()) e.preventDefault(); return; } // the shot inspector has its own
     if (k === "z" && !e.shiftKey) { e.preventDefault(); undo(); return; }
     if ((k === "z" && e.shiftKey) || k === "y") { e.preventDefault(); redo(); return; }
+    if ((k === "arrowleft" || k === "arrowright") && selected) {
+      // Ctrl+←/→: slide the selected clip(s) by exactly 1% (Shift: 5%) of the main clip, like a Ctrl+drag.
+      e.preventDefault();
+      if (sliding.current) return; // wait for the last step to land (clip ids can change)
+      const all = tl.bars.flatMap((b) => b.slots);
+      const main = all.find((s) => s.id === selected);
+      if (!main) return;
+      const step = (e.shiftKey ? 5 : 1) * (k === "arrowleft" ? 1 : -1); // left = frame earlier = contact further in
+      const from = main.pos + (main.off ?? 0);
+      const pct = Math.max(0, Math.min(100, contactPct(main, from) + step));
+      const group = sel.length > 1 ? all.filter((s) => sel.includes(s.id)) : [main];
+      const [lo, hi] = groupSlideRange(group);
+      const delta = Math.max(lo, Math.min(hi, main.pos + (main.hit ?? 0) - (pct / 100) * main.len - from));
+      if (Math.abs(delta) < 1e-4) return;
+      sliding.current = true;
+      (group.length > 1 ? edit("slide_spans", { ids: sel, delta }) : edit("slide_span", { slot_id: main.id, start: from + delta }))
+        .finally(() => { sliding.current = false; });
+      return;
+    }
     if (k === "c" && sel.length) {
-      const items = sel.map(absOf).filter(Boolean).sort((x, y) => x!.a - y!.a) as { a: number; s: Slot }[];
-      clipboard.current = items.map(({ a, s }) => ({ shot_id: s.shot_id, len: s.len, off: a - items[0].a, hit: s.hit ?? 0, shift: s.off ?? 0 }));
+      const items = (sel.map(absOf).filter(Boolean) as { a: number; s: Slot }[]).sort((x, y) => x.s.start - y.s.start);
+      clipboard.current = items.map(({ s }) => ({
+        shot_id: s.shot_id, off: s.start - items[0].s.start, dur: s.end - s.start, lead: s.contact - s.start,
+      }));
       setCopied({ n: items.length, label: items.length === 1 ? items[0].s.label ?? "clip" : null, at: Date.now() });
       e.preventDefault();
     } else if (k === "v" && clipboard.current.length) {
       // Selected clips: paste stitched right after them. Otherwise the clip under the playhead, else the
       // nearest note before the playhead.
       let at = 0;
-      const ends = sel.map(absOf).filter(Boolean).map((x) => x!.a + x!.s.len);
+      const ends = sel.map(absOf).filter(Boolean).map((x) => x!.s.end);
       const bi = tl.bars.findIndex((b) => b.slots.some((s) => time >= s.start && time < s.end));
       if (ends.length) {
-        at = Math.max(...ends);
+        at = Math.max(...ends); // exactly where the selection ends on screen
       } else if (bi >= 0) {
         const s = tl.bars[bi].slots.find((s) => time >= s.start && time < s.end)!;
-        at = bi * 16 + s.pos + s.len;
+        at = s.end;
       } else {
-        const b = tl.bars.findIndex((b) => time >= b.t0 && time < b.t1);
-        if (b >= 0) at = b * 16 + Math.floor(((time - tl.bars[b].t0) / (tl.bars[b].t1 - tl.bars[b].t0)) * 8) * 2;
+        const b = tl.bars.find((b) => time >= b.t0 && time < b.t1);
+        at = b ? b.t0 + Math.floor(((time - b.t0) / (b.t1 - b.t0)) * 8) * ((b.t1 - b.t0) / 8) : tl.bars[0].t0;
       }
       edit("paste_slots", { items: clipboard.current, at });
       e.preventDefault();
@@ -360,13 +398,13 @@ export default function Editor({ project, setProject, meta }: {
     const s = tl?.bars.flatMap((b) => b.slots).find((x) => x.id === selected);
     const sh = s && project.shots.find((x) => x.id === s.shot_id);
     if (!s || !sh) return false;
-    const { min, max } = nudgeBounds(sh, s);
+    const { min, max } = nudgeBounds(sh, s, project.videos.find((v) => v.id === sh.video_id)?.duration);
     const base = nudges.current[sh.id] ?? sh.nudge ?? 0;
     nudge(sh.id, Math.max(min, Math.min(max, base + d)));
     return true;
   };
 
-  const dialogOpen = rallyOpen || exportOpen || skeletonOpen;
+  const dialogOpen = exportOpen || skeletonOpen;
   useHotkeys((e) => {
     if (!tl || inspectId) return; // a library shot on its own: ShotInspector handles the keys
     if (e.key === "," || e.key === "<") return nudgeSelected(e.shiftKey ? -0.1 : -FRAME);
@@ -462,12 +500,8 @@ export default function Editor({ project, setProject, meta }: {
         selected={selected} selection={sel}
         onSelect={(id, add) => setSel((cur) => !id ? [] : !add ? [id] : cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id])}
         onSelectMany={setSel}
-        onEdit={edit} onOpenRally={() => setRallyOpen(true)}
+        onEdit={edit}
         onNudge={nudge} onNudgeMany={nudgeMany} onStepFrame={stepFrame} onMarkContact={markContact} />
-      {rallyOpen && (
-        <RallyPicker project={project} setProject={setProject} onClose={() => setRallyOpen(false)}
-          onPick={(id, start) => { setRallyOpen(false); edit("set_rally", { rally_id: id, start_hit: start }); }} />
-      )}
       {skeletonOpen && (
         <SkeletonDialog timeline={tl} onClose={() => setSkeletonOpen(false)} onApply={applySkeleton} />
       )}

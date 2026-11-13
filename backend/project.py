@@ -137,6 +137,43 @@ def list_projects() -> list[dict]:
     return out
 
 
+def list_videos() -> list[dict]:
+    """Every video file any reel has read, one entry per file path, with the reels that use it, how many of
+    my shots were found in it and whether its analysis is cached (so it won't be read again)."""
+    by_path: dict[str, dict] = {}
+    for summary in list_projects():
+        try:
+            p = load(summary["id"])
+        except Exception:
+            continue
+        shots_per_video: dict[str, int] = {}
+        for s in p.get("shots", []):
+            shots_per_video[s["video_id"]] = shots_per_video.get(s["video_id"], 0) + 1
+        for v in p.get("videos", []):
+            e = by_path.setdefault(v["path"], {
+                "path": v["path"], "name": v["name"], "folder": str(Path(v["path"]).parent),
+                "duration": None, "size": None, "exists": False, "analyzed": False, "cached": False,
+                "reels": [], "shots": 0,
+            })
+            if v.get("duration"):  # set when a finished analysis read the file
+                e["duration"] = v["duration"]
+                e["analyzed"] = e["analyzed"] or p.get("status") == "ready"
+            e["shots"] += shots_per_video.get(v["id"], 0)
+            e["reels"].append({"id": p["id"], "name": p["name"], "status": p.get("status"),
+                               "shots": shots_per_video.get(v["id"], 0)})
+    for e in by_path.values():
+        f = Path(e["path"])
+        try:
+            st = f.stat()  # metadata only: doesn't make Google Drive download the file
+        except OSError:
+            continue
+        e["exists"], e["size"] = True, st.st_size
+        # Same name analyze_footage writes; it changes if the file is edited or re-synced, so a new reel would
+        # read the file again.
+        e["cached"] = (config.CACHE / f"{_file_key(e['path'])}-v2.json").exists()
+    return sorted(by_path.values(), key=lambda e: (e["folder"].lower(), e["name"].lower()))
+
+
 def create(name: str, footage_dir: str, song_path: str, handed: str) -> dict:
     fd = Path(footage_dir)
     if not fd.is_dir():

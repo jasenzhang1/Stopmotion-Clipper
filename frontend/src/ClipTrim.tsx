@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { proxyEnd, Shot, Slot } from "./api";
+import { Shot, Slot } from "./api";
 
 export const NUDGE_MAX = 0.75; // must match the backend's limit
 export const FRAME = 1 / 30;
@@ -8,12 +8,13 @@ const W = 300;
 
 const sec = (v: number) => `${v >= 0 ? "+" : "−"}${Math.abs(v).toFixed(2)}s`;
 
-/** How far a clip's footage can slide while staying inside its preview clip. */
-export function nudgeBounds(shot: Shot, slot: Slot) {
+/** How far a clip's footage can slide: anywhere, as long as it stays inside the source video (`videoDur`).
+ * The server cuts a longer preview clip when the footage runs past the current one. */
+export function nudgeBounds(shot: Shot, slot: Slot, videoDur?: number | null) {
   const dur = slot.end - slot.start;
   return {
-    min: shot.proxy.start - shot.t + slot.lead,
-    max: proxyEnd(shot) - shot.t - dur + slot.lead,
+    min: slot.lead - shot.t,
+    max: videoDur ? videoDur - shot.t - dur + slot.lead : Infinity,
   };
 }
 

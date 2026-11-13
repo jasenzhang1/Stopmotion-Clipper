@@ -67,6 +67,8 @@ def export(project: dict, tl: dict, out_path: Path, resolution: str = "source", 
             segs.append((vid, src + (f0 - frame(start)) / fps, f1 - f0))
             cur = f1
         cur = max(cur, f0)
+    if tl.get("reel_end") and frame(tl["reel_end"]) > cur:  # black up to the song step's END marker
+        segs.append((None, 0.0, frame(tl["reel_end"]) - cur))
     if not any(v for v, _, _ in segs):
         raise RuntimeError("Timeline is empty.")
 

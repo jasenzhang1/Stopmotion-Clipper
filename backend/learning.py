@@ -59,6 +59,45 @@ def update(fn) -> dict:
         return p
 
 
+# ---------------------------------------------------------------- where a rally ends
+# A rally (point) ends when the ball doesn't come back for a while. The app starts at POINT_GAP seconds and learns
+# from your corrections in the rally tab: each "the rally ended here" (a break) or "this is the same rally"
+# (a join) is remembered with how long the pause was, and the threshold moves to fit them, across projects.
+
+POINT_GAP = 5.5
+POINT_GAP_RANGE = (2.5, 10.0)  # never so short that ordinary rallies get chopped up, nor absurdly long
+
+
+def record_break(key: str, gap: float | None, is_break: bool | None) -> None:
+    """Remember (or with is_break=None, forget) your verdict on the pause before a contact. `key` names the
+    contact (project/video/time) so changing your mind replaces the old verdict."""
+    def fn(p: dict) -> None:
+        ex = p.setdefault("break_examples", {})
+        if is_break is None or gap is None:
+            ex.pop(key, None)
+        else:
+            ex[key] = {"gap": round(float(gap), 3), "break": bool(is_break)}
+        if len(ex) > 3000:  # keep the most recent
+            for k in list(ex)[:len(ex) - 3000]:
+                ex.pop(k)
+    update(fn)
+
+
+def point_gap(prefs: dict | None = None) -> float:
+    """The pause (seconds) after which a rally counts as over, fitted to your corrections: the threshold that
+    gets the most of them right (ties: the one closest to the default)."""
+    ex = list(((prefs or load()).get("break_examples") or {}).values())
+    if not ex:
+        return POINT_GAP
+    lo, hi = POINT_GAP_RANGE
+    gaps = sorted({e["gap"] for e in ex})
+    cands = {POINT_GAP, lo, hi} | {g - 0.05 for g in gaps} | {g + 0.05 for g in gaps} | {(a + b) / 2 for a, b in zip(gaps, gaps[1:])}
+    cands = [c for c in cands if lo <= c <= hi]
+    # A pause longer than the threshold ends the rally.
+    wrong = lambda T: sum(1 for e in ex if (e["gap"] > T) != e["break"])
+    return round(min(cands, key=lambda T: (wrong(T), abs(T - POINT_GAP))), 3)
+
+
 def profile(mood: str | None) -> dict:
     """Effective profile: the mood's profile blended with the global one by experience."""
     prefs = load()
@@ -95,6 +134,8 @@ def type_group(t: str) -> str:
 
 
 def _summary(tl: dict, shots: dict[str, dict]) -> dict:
+    # Only the build-up is generated, so only it is learned from (after the drop is the user's own region).
+    tl = {**tl, "bars": [b for b in tl["bars"] if b["k"] < 0]}
     slots = [s for b in tl["bars"] for s in b["slots"]]
     mix: dict[str, float] = {}
     for s in slots:

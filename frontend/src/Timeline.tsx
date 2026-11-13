@@ -8,11 +8,26 @@ const WAVE = 44;
 /** Song time of a grid position (sixteenths) inside a bar. */
 const posTime = (b: Bar, pos: number) => b.t0 + (pos * (b.t1 - b.t0)) / 16;
 
-export default function Timeline({ project, timeline, time, onSeek, selected, selection, onSelect, onSelectMany, onEdit, onOpenRally,
+/** How far into the clip its contact is, as a whole percent, if the frame starts at `start` (sixteenths). */
+export const contactPct = (s: Slot, start: number) => Math.round(((s.pos + (s.hit ?? 0) - start) / s.len) * 100);
+/** The frame start (sixteenths) nearest `start` that puts the contact a whole percent into the clip. */
+export const wholePct = (s: Slot, start: number) => s.pos + (s.hit ?? 0) - (contactPct(s, start) / 100) * s.len;
+/** How far (sixteenths) a group of clips can slide together: each one's contact must stay inside its frame. */
+export const groupSlideRange = (group: Slot[]): [number, number] => {
+  let lo = -Infinity, hi = Infinity;
+  for (const x of group) {
+    const c = x.pos + (x.hit ?? 0), st = x.pos + (x.off ?? 0);
+    lo = Math.max(lo, c - x.len - st);
+    hi = Math.min(hi, c - st);
+  }
+  return [lo, hi];
+};
+
+export default function Timeline({ project, timeline, time, onSeek, selected, selection, onSelect, onSelectMany, onEdit,
   onNudge, onNudgeMany, onStepFrame, onMarkContact }: {
   project: Project; timeline: TL; time: number; onSeek: (t: number) => void;
   selected: string | null; selection: string[]; onSelect: (id: string | null, add?: boolean) => void; onSelectMany: (ids: string[]) => void;
-  onEdit: (op: string, args: Record<string, unknown>) => void; onOpenRally: () => void;
+  onEdit: (op: string, args: Record<string, unknown>) => void;
   onNudge: (shotId: string, nudge: number) => void; onNudgeMany: (values: Record<string, number>) => void;
   onStepFrame: (d: number) => void; onMarkContact: () => void;
 }) {
@@ -23,26 +38,41 @@ export default function Timeline({ project, timeline, time, onSeek, selected, se
   const wave = useRef<HTMLCanvasElement>(null);
   const [pps, setPps] = useState(60);
   const [over, setOver] = useState<string | null>(null);
-  const [resize, setResize] = useState<{ id: string; len: number } | null>(null);
-  const [leftDrag, setLeftDrag] = useState<{ id: string; pos: number } | null>(null);
+  /** A right-edge drag in progress: the clip's visible length and where its frame ends (sixteenths into its bar). */
+  const [resize, setResize] = useState<{ id: string; len: number; end: number; snapped: boolean } | null>(null);
+  /** A left-edge drag in progress: where the frame would start (sixteenths into its bar; may be negative). */
+  const [leftDrag, setLeftDrag] = useState<{ id: string; pos: number; snapped: boolean } | null>(null);
   /** Left edge: snaps to the grid. Earlier shows more before the contact; the contact and right edge stay put. */
   const startLeft = (e: React.PointerEvent, b: Bar, s: Slot) => {
     e.preventDefault();
     e.stopPropagation();
+    // In sixteenths from this bar's start; negative = back into earlier bars. The right end and the contact
+    // stay put. Snaps to the grid, or exactly onto the end of the clip before it when close (Alt: free).
     const contact = s.pos + (s.hit ?? 0);
-    let pos = s.pos;
+    const end = s.pos + (s.off ?? 0) + s.len + (s.ext ?? 0);
+    const from = s.pos + (s.off ?? 0);
+    const bi = bars.indexOf(b);
+    const lo = -bi * 16, hi = Math.min(contact, end - unit);
+    const flat = timeline.bars.flatMap((bb) => bb.slots);
+    const prev = flat[flat.findIndex((x) => x.id === s.id) - 1];
+    const prevEnd = prev && prev.end < s.start - 1e-4 ? ((prev.end - b.t0) / barDur) * 16 : null;
+    let start = from;
     const move = (ev: PointerEvent) => {
       const raw = ((timeAt(ev.clientX) - b.t0) / barDur) * 16;
-      pos = Math.max(0, Math.min(contact, Math.round(raw / unit) * unit));
-      setLeftDrag({ id: s.id, pos });
+      let snapped = false;
+      if (ev.altKey) start = raw;
+      else if (prevEnd !== null && Math.abs(raw - prevEnd) * px16 < 10) { start = prevEnd; snapped = true; }
+      else start = Math.round(raw / unit) * unit;
+      start = Math.max(lo, Math.min(hi, start));
+      setLeftDrag({ id: s.id, pos: start, snapped });
     };
     const up = () => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
       setLeftDrag(null);
-      if (pos !== s.pos) onEdit("resize_left", { slot_id: s.id, pos });
+      if (Math.abs(start - from) > 1e-4) onEdit("resize_start", { slot_id: s.id, start: Math.round(start * 1e4) / 1e4 });
     };
-    setLeftDrag({ id: s.id, pos });
+    setLeftDrag({ id: s.id, pos: start, snapped: false });
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
   };
@@ -142,29 +172,40 @@ export default function Timeline({ project, timeline, time, onSeek, selected, se
   const startHit = (e: React.PointerEvent, b: Bar, s: Slot) => {
     e.preventDefault();
     e.stopPropagation();
+    // Anywhere in the visible frame, from its first moment to its last. Grid lines (and the clip's edges) pull
+    // the line onto them when it's dragged close; hold Alt to place it freely.
     const off = s.off ?? 0;
-    const lo = Math.ceil((off - 1e-6) / unit) * unit, hi = Math.floor((off + s.len + 1e-6) / unit) * unit;
+    const lo = off, hi = off + s.len + (s.ext ?? 0);
+    const SNAP_PX = 6;
     let hit = s.hit ?? 0;
     const mv = (ev: PointerEvent) => {
-      const g = ((timeAt(ev.clientX) - b.t0) / barDur) * 16 - s.pos;
-      hit = Math.max(lo, Math.min(hi, Math.round(g / unit) * unit));
+      const g = Math.max(lo, Math.min(hi, ((timeAt(ev.clientX) - b.t0) / barDur) * 16 - s.pos));
+      hit = g;
+      if (!ev.altKey) {
+        const grid = Math.round(g / unit) * unit;
+        const near = [lo, hi, ...(grid >= lo && grid <= hi ? [grid] : [])].sort((p, q) => Math.abs(p - g) - Math.abs(q - g))[0];
+        if (Math.abs(near - g) * px16 < SNAP_PX) hit = near;
+      }
       setHitDrag({ id: s.id, hit });
     };
     const up = () => {
       window.removeEventListener("pointermove", mv);
       window.removeEventListener("pointerup", up);
       setHitDrag(null);
-      if (hit !== (s.hit ?? 0)) onEdit("set_hit", { slot_id: s.id, hit });
+      if (Math.abs(hit - (s.hit ?? 0)) > 1e-4) onEdit("set_hit", { slot_id: s.id, hit: Math.round(hit * 1e4) / 1e4 });
     };
     setHitDrag({ id: s.id, hit });
     window.addEventListener("pointermove", mv);
     window.addEventListener("pointerup", up);
   };
-  const [slide, setSlide] = useState<{ id: string; start: number; bi: number; snap: "left" | "right" | null } | null>(null);
+  /** A Ctrl+drag in progress: each sliding clip's frame start (sixteenths into its bar); `id` is the one dragged. */
+  const [slide, setSlide] = useState<{ id: string; starts: Record<string, number>; snap: "left" | "right" | null } | null>(null);
   /** Ctrl+drag: slide the clip's frame freely (any start) while the contact stays on its beat; the contact can
-   * end up anywhere from the clip's start to its end. */
+   * end up anywhere from the clip's start to its end. On a multi-selection every selected clip slides by the
+   * same amount, so touching clips stay touching. The dragged clip settles on whole percents (Shift = slower). */
   const startSlide = (e: React.PointerEvent, bi: number, s: Slot) => {
     e.preventDefault();
+    if (selection.length > 1 && selection.includes(s.id)) { startGroupSlide(e, s); return; }
     const x0 = e.clientX;
     const contact = s.pos + (s.hit ?? 0);
     const from = s.pos + (s.off ?? 0);
@@ -187,17 +228,43 @@ export default function Timeline({ project, timeline, time, onSeek, selected, se
     const mv = (ev: PointerEvent) => {
       if (!dragged.current && Math.abs(ev.clientX - x0) < 3) return;
       dragged.current = true;
-      start = Math.max(lo, Math.min(hi, from + (ev.clientX - x0) / px16 * (ev.shiftKey ? 0.25 : 1)));
+      start = Math.max(lo, Math.min(hi, wholePct(s, from + (ev.clientX - x0) / px16 * (ev.shiftKey ? 0.25 : 1))));
       let snap: "left" | "right" | null = null;
       if (leftEdge !== null && Math.abs(start - leftEdge) * px16 < SNAP_PX && leftEdge >= lo && leftEdge <= hi) { start = leftEdge; snap = "left"; }
       else if (rightEdge !== null && Math.abs(start - rightEdge) * px16 < SNAP_PX && rightEdge >= lo && rightEdge <= hi) { start = rightEdge; snap = "right"; }
-      setSlide({ id: s.id, start, bi, snap });
+      setSlide({ id: s.id, starts: { [s.id]: start }, snap });
     };
     const up = () => {
       window.removeEventListener("pointermove", mv);
       window.removeEventListener("pointerup", up);
       setSlide(null);
       if (dragged.current && Math.abs(start - from) > 1e-3) onEdit("slide_span", { slot_id: s.id, start });
+    };
+    window.addEventListener("pointermove", mv);
+    window.addEventListener("pointerup", up);
+  };
+  /** Ctrl+drag on one of several selected clips: slide them all by the same amount. */
+  const startGroupSlide = (e: React.PointerEvent, s: Slot) => {
+    const x0 = e.clientX;
+    const group = timeline.bars.flatMap((b) => b.slots).filter((x) => selection.includes(x.id));
+    const froms = Object.fromEntries(group.map((x) => [x.id, x.pos + (x.off ?? 0)]));
+    const [lo, hi] = groupSlideRange(group);
+    const from = froms[s.id];
+    let delta = 0;
+    dragged.current = false;
+    onSeek(s.contact);
+    const mv = (ev: PointerEvent) => {
+      if (!dragged.current && Math.abs(ev.clientX - x0) < 3) return;
+      dragged.current = true;
+      const raw = from + (ev.clientX - x0) / px16 * (ev.shiftKey ? 0.25 : 1);
+      delta = Math.max(lo, Math.min(hi, wholePct(s, raw) - from));
+      setSlide({ id: s.id, starts: Object.fromEntries(group.map((x) => [x.id, froms[x.id] + delta])), snap: null });
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", mv);
+      window.removeEventListener("pointerup", up);
+      setSlide(null);
+      if (dragged.current && Math.abs(delta) > 1e-3) onEdit("slide_spans", { ids: selection, delta });
     };
     window.addEventListener("pointermove", mv);
     window.addEventListener("pointerup", up);
@@ -279,19 +346,37 @@ export default function Timeline({ project, timeline, time, onSeek, selected, se
   const startResize = (e: React.PointerEvent, b: Bar, s: Slot) => {
     e.preventDefault();
     e.stopPropagation();
-    let len = s.len;
+    // Lengths are measured from where the clip visibly starts (a Ctrl+dragged frame starts off the grid), and
+    // the right edge may run past the bar line into the next bar.
+    const start = s.pos + (s.off ?? 0);
+    const bi = bars.indexOf(b);
+    const maxLen = (bars.length - bi) * 16 - start; // not past the last bar
+    const minLen = Math.max(unit, Math.ceil((s.pos + (s.hit ?? 0) - start) / unit) * unit); // the contact stays inside
+    const curLen = s.len + (s.ext ?? 0);
+    let len = curLen;
+    let snapEnd: number | null = null;
+    // Where the next clip begins (sixteenths into this bar): dragging close snaps exactly onto it.
+    const flat = timeline.bars.flatMap((bb) => bb.slots);
+    const nxt = flat[flat.findIndex((x) => x.id === s.id) + 1];
+    const nextStart = nxt && nxt.start > s.end + 1e-4 ? ((nxt.start - b.t0) / barDur) * 16 : null;
     const move = (ev: PointerEvent) => {
-      const raw = ((timeAt(ev.clientX) - b.t0) / barDur) * 16 - s.pos;
-      len = Math.max((s.hit ?? 0) + unit, Math.min(16 - s.pos, Math.round(raw / unit) * unit)); // contact stays inside
-      setResize({ id: s.id, len });
+      const at = ((timeAt(ev.clientX) - b.t0) / barDur) * 16;
+      snapEnd = nextStart !== null && Math.abs(at - nextStart) * px16 < 10 ? nextStart : null;
+      len = Math.max(minLen, Math.min(maxLen, Math.round((at - start) / unit) * unit));
+      setResize({ id: s.id, len, end: snapEnd ?? start + len, snapped: snapEnd !== null });
     };
     const up = () => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
       setResize(null);
-      if (len !== s.len) onEdit("resize_slot", { slot_id: s.id, len });
+      if (snapEnd !== null) onEdit("resize_end", { slot_id: s.id, end: snapEnd });
+      else if (Math.abs(len - curLen) < 1e-6) return;
+      // On the grid and inside the bar: an ordinary resize (it overwrites what it runs into). A slid frame or
+      // one crossing the bar line ends exactly where it was dragged.
+      else if ((s.off ?? 0) === 0 && Number.isInteger(len) && s.pos + len <= 16) onEdit("resize_slot", { slot_id: s.id, len });
+      else onEdit("resize_end", { slot_id: s.id, end: start + len });
     };
-    setResize({ id: s.id, len });
+    setResize({ id: s.id, len, end: start + len, snapped: false });
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
   };
@@ -318,7 +403,7 @@ export default function Timeline({ project, timeline, time, onSeek, selected, se
     return n;
   }, [timeline]);
 
-  // Black stretches (no clip), from the reel start to the rally.
+  // Black stretches (no clip), from the reel start to its end (the song step's END marker).
   const gaps = useMemo(() => {
     const flat = timeline.bars.flatMap((b) => b.slots);
     const out: { a: number; b: number }[] = [];
@@ -327,21 +412,26 @@ export default function Timeline({ project, timeline, time, onSeek, selected, se
       if (s.start - cur > 0.01) out.push({ a: cur, b: s.start });
       cur = Math.max(cur, s.end);
     }
-    const stop = timeline.rally?.start ?? timeline.drop;
-    if (stop - cur > 0.01) out.push({ a: cur, b: stop });
+    if (timeline.reel_end - cur > 0.01) out.push({ a: cur, b: timeline.reel_end });
     return out;
   }, [timeline]);
 
   // What a drag in progress will do: where the ghost goes and which clips it will wipe out.
   const moving = move && timeline.bars.flatMap((b) => b.slots).find((s) => s.id === move.id);
   const doomed = move && moving && !move.swap ? covered(move.bi, move.pos, moving.len, moving.id)
-    : resize ? (() => {
-      const bi = bars.findIndex((b) => b.slots.some((s) => s.id === resize.id));
-      const pos = bars[bi]?.slots.find((s) => s.id === resize.id)?.pos ?? 0;
-      return covered(bi, pos, resize.len, resize.id);
+    : resize ? (() => { // clips the stretched frame covers completely, in this bar or the next ones
+      const b = bars.find((bb) => bb.slots.some((s) => s.id === resize.id));
+      const r = b?.slots.find((s) => s.id === resize.id);
+      if (!b || !r) return new Set<string>();
+      const a = r.start, e = posTime(b, resize.end);
+      return new Set(bars.flatMap((bb) => bb.slots).filter((o) => o.id !== r.id && o.start >= a - 1e-4 && o.end <= e + 1e-4).map((o) => o.id));
+    })() : leftDrag ? (() => { // the same for a left edge pulled back over earlier clips
+      const b = bars.find((bb) => bb.slots.some((s) => s.id === leftDrag.id));
+      const r = b?.slots.find((s) => s.id === leftDrag.id);
+      if (!b || !r) return new Set<string>();
+      const a = posTime(b, leftDrag.pos), e = r.end;
+      return new Set(bars.flatMap((bb) => bb.slots).filter((o) => o.id !== r.id && o.start >= a - 1e-4 && o.end <= e + 1e-4).map((o) => o.id));
     })() : new Set<string>();
-  const rally = timeline.rally;
-  const lastK = timeline.bars.length ? timeline.bars[timeline.bars.length - 1].k : 0;
 
   return (
     <div className="timeline">
@@ -354,13 +444,10 @@ export default function Timeline({ project, timeline, time, onSeek, selected, se
           {/* Bar headers */}
           <div className="lane" style={{ height: 28 }}>
             {timeline.bars.map((b) => (
-              <div key={b.k} className={`bar-head ${b.k % 8 === 0 ? "phrase" : ""}`} style={{ left: x(b.t0), width: x(b.t1) - x(b.t0) }}>
-                <span>{b.k === lastK ? "→drop" : `bar ${b.k}`}</span>
+              <div key={b.k} className={`bar-head ${b.k % 8 === 0 ? "phrase" : ""} ${b.k === 0 ? "drop-head" : ""}`} style={{ left: x(b.t0), width: x(b.t1) - x(b.t0) }}>
+                <span>{b.k === 0 ? "DROP" : b.k === -1 ? "→drop" : b.k > 0 ? `+${b.k}` : `bar ${b.k}`}</span>
               </div>
             ))}
-            {rally && (
-              <div className="bar-head" style={{ left: x(timeline.drop), color: "var(--accent)", fontWeight: 700 }}>DROP · rally</div>
-            )}
           </div>
           {/* Tick ruler + waveform */}
           <div className="lane" style={{ height: RULER + WAVE }} onClick={seekFromEvent}>
@@ -380,16 +467,17 @@ export default function Timeline({ project, timeline, time, onSeek, selected, se
             {timeline.bars.flatMap((b, bi) => b.slots.map((s) => {
               const sh = shots[s.shot_id];
               const len = resize?.id === s.id ? resize.len : s.len;
-              const right = resize?.id === s.id ? posTime(b, s.pos + len) : s.end;
-              const sliding = slide?.id === s.id;
-              const left = leftDrag?.id === s.id ? posTime(b, leftDrag.pos) : sliding ? posTime(b, slide!.start) : s.start;
-              const rightEdge = sliding ? posTime(b, slide!.start + s.len) : right;
+              const right = resize?.id === s.id ? posTime(b, resize.end) : s.end;
+              const slideStart = slide?.starts[s.id];
+              const sliding = slideStart !== undefined;
+              const left = leftDrag?.id === s.id ? posTime(b, leftDrag.pos) : sliding ? posTime(b, slideStart) : s.start;
+              const rightEdge = sliding ? posTime(b, slideStart + s.len) : right;
               const isRepeat = !!s.label && (labelUses[s.label] ?? 0) > 1;
               const isMoving = move?.id === s.id;
               return (
                 <div key={s.id} data-slot={s.id}
                   className={`slot ${selected === s.id ? "sel" : selection.includes(s.id) ? "sel multi" : ""} ${over === s.id || move?.swap === s.id ? "dragover" : ""}`
-                    + ` ${resize?.id === s.id || leftDrag?.id === s.id || slide?.id === s.id ? "resizing" : ""} ${sliding && slide!.snap ? `snapped-${slide!.snap}` : ""} ${isMoving || (gmove !== null && selection.includes(s.id)) ? "lifted" : ""} ${doomed.has(s.id) ? "doomed" : ""}`}
+                    + ` ${resize?.id === s.id || leftDrag?.id === s.id || sliding ? "resizing" : ""} ${sliding && slide!.snap ? `snapped-${slide!.snap}` : ""} ${resize?.id === s.id && resize.snapped ? "snapped-right" : ""} ${isMoving || (gmove !== null && selection.includes(s.id)) ? "lifted" : ""} ${doomed.has(s.id) ? "doomed" : ""}`}
                   style={{ left: x(left), width: Math.max(2, x(rightEdge) - x(left)),
                     backgroundImage: sh ? `url(${fileUrl(project.id, sh.thumb)})` : undefined }}
                   onPointerDown={(e) => startMove(e, bi, s)}
@@ -414,31 +502,39 @@ export default function Timeline({ project, timeline, time, onSeek, selected, se
                   }}
                   title={sh ? `${s.label ?? ""} · ${sh.type} · ${sh.stars}★ · ${NOTE_NAME[s.len] ?? `${s.len / 4} beats`}`
                     + `${isRepeat ? " · this exact clip is used more than once" : ""}`
-                    + " · drag to move (Alt to swap) · Shift+click to select several · Ctrl+drag to slide the clip around its contact" : s.id}
+                    + " · drag to move (Alt to swap) · Shift+click to select several · Ctrl+drag to slide the clip around its contact (all selected clips together)"
+                    + " · Ctrl+←/→ to slide by 1% (Shift: 5%)" : s.id}
                 >
                   <div className={`contact-line grab ${hitDrag?.id === s.id ? "dragging" : ""}`}
                     style={{ left: (hitDrag?.id === s.id ? x(posTime(b, s.pos + hitDrag.hit)) : x(s.contact)) - x(left) }}
                     onPointerDown={(e) => startHit(e, b, s)}
-                    title="Drag to move the contact within the clip (snaps to the beat grid)">
+                    title="Drag to move the contact anywhere in the clip (it snaps to beats and the clip's edges when close; hold Alt to place it freely)">
                     <span className="knob" />
                   </div>
                   {hitDrag?.id === s.id && (
-                    <div className="note-tag">contact {(hitDrag.hit - (s.off ?? 0)) <= 0.05 ? "at the start" : hitDrag.hit - (s.off ?? 0) >= s.len - 0.05 ? "at the end" : `${(hitDrag.hit - (s.off ?? 0)) / 2}/8 in`}</div>
+                    (() => {
+                      const into = hitDrag.hit - (s.off ?? 0), span = s.len + (s.ext ?? 0);
+                      const onBeat = Math.abs(hitDrag.hit - Math.round(hitDrag.hit / unit) * unit) < 1e-4;
+                      return <div className="note-tag">contact {into <= 1e-4 ? "at the start" : into >= span - 1e-4 ? "at the end" : `${Math.round((into / span) * 100)}% in`}{onBeat ? " · on the beat" : ""}</div>;
+                    })()
                   )}
                   <div className="icons">
                     {isRepeat && <span title="This exact clip is used more than once">↻</span>}
                   </div>
                   {sh && <div className={`lbl t-${sh.type}`}>{s.label ?? "?"}</div>}
-                  {resize?.id === s.id && <div className="note-tag">{NOTE_NAME[len] ?? `${len / 4} beats`}</div>}
+                  {resize?.id === s.id && <div className="note-tag">{resize.snapped ? "touching the next clip ⇥" : NOTE_NAME[len] ?? `${len / 4} beats`}{!resize.snapped && resize.end > 16 + 1e-6 ? " · into the next bar" : ""}</div>}
                   <div className="handle left" onPointerDown={(e) => startLeft(e, b, s)} title="Drag to start the clip earlier or later (the contact stays put)" />
                   <div className="handle" onPointerDown={(e) => startResize(e, b, s)} title="Drag to change where the clip ends" />
-                  {sliding && (() => {
-                    const h = s.pos + (s.hit ?? 0) - slide!.start;
-                    return <div className="note-tag">{slide!.snap === "left" ? "⇤ touching the clip on the left · " : slide!.snap === "right" ? "touching the clip on the right ⇥ · " : ""}contact {h < 0.05 ? "at the start" : h > s.len - 0.05 ? "at the end" : `${Math.round((h / s.len) * 100)}% in`}</div>;
+                  {sliding && slide!.id === s.id && (() => {
+                    const h = s.pos + (s.hit ?? 0) - slideStart;
+                    const n = Object.keys(slide!.starts).length;
+                    return <div className="note-tag">{n > 1 ? `${n} clips · ` : ""}{slide!.snap === "left" ? "⇤ touching the clip on the left · " : slide!.snap === "right" ? "touching the clip on the right ⇥ · " : ""}contact {h < 0.005 ? "at the start" : h > s.len - 0.005 ? "at the end" : `${Math.round((h / s.len) * 100)}% in`}</div>;
                   })()}
                   {leftDrag?.id === s.id && (() => {
-                    const ln = s.pos + s.len - leftDrag.pos;
-                    return <div className="note-tag">{NOTE_NAME[ln] ?? `${ln / 2} eighths`} · {(s.pos + (s.hit ?? 0) - leftDrag.pos) / 2}/8 before contact</div>;
+                    const ln = s.pos + (s.off ?? 0) + s.len + (s.ext ?? 0) - leftDrag.pos; // visible length, sixteenths
+                    const before = s.pos + (s.hit ?? 0) - leftDrag.pos;
+                    const name = Math.abs(ln - Math.round(ln)) < 1e-4 ? NOTE_NAME[Math.round(ln)] : undefined;
+                    return <div className="note-tag">{leftDrag.snapped ? "⇤ touching the clip on the left · " : ""}{name ?? `${(ln / 4).toFixed(2)} beats`} · contact {ln > 0 ? Math.round((before / ln) * 100) : 0}% in{leftDrag.pos < 0 ? " · into the bar before" : ""}</div>;
                   })()}
                 </div>
               );
@@ -465,12 +561,6 @@ export default function Timeline({ project, timeline, time, onSeek, selected, se
                 </div>
               );
             })()}
-            {rally && (
-              <div className="rally-block" style={{ left: x(rally.start), width: x(rally.end) - x(rally.start) }}
-                onClick={(e) => { e.stopPropagation(); onOpenRally(); }} title="Click to choose a different rally">
-                RALLY · {rally.n_hits} shots · {(rally.end - rally.start).toFixed(1)}s ✎
-              </div>
-            )}
           </div>
           <div className="marker drop" style={{ left: x(timeline.drop) }} />
           <div className="marker head" style={{ left: x(time) }} />

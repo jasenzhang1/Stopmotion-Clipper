@@ -47,6 +47,8 @@ export interface Slot {
   hit?: number;
   /** Free shift of the clip's frame from the grid, in sixteenths (Ctrl+drag). */
   off?: number;
+  /** Free extension of the clip's end beyond its grid length, in sixteenths. */
+  ext?: number;
   start: number;
   end: number;
   shot_id: string;
@@ -70,9 +72,16 @@ export interface Bar {
 }
 
 export interface RallyRef {
-  rally_id: string;
-  start_hit: number;
-  n_hits: number;
+  /** Made in the rally tab (a stretch of a strand)... */
+  rally_id?: string;
+  start_hit?: number;
+  /** ...or any shot placed on the drop in the editor: it plays on from its contact. */
+  shot_id?: string;
+  /** Seconds of footage after the drop, as the user dragged it (else up to the song's END marker). */
+  len?: number;
+  /** The preview clip that covers it (shot-based drops). */
+  proxy?: { file: string; start: number };
+  n_hits: number | null;
   video_id: string;
   start: number;
   end: number;
@@ -87,6 +96,8 @@ export interface Timeline {
   drop: number;
   bars: Bar[];
   rally: RallyRef | null;
+  /** The drop footage starts this many seconds before the drop (a cut on the grid). */
+  rally_lead?: number;
   reel_start: number;
   reel_end: number;
   duration: number;
@@ -163,6 +174,39 @@ export type ServeMarksPatch = { detect?: boolean; toss?: number; apex?: number }
 export interface StrandHit {
   t: number; player: "me" | "opp"; shot_id?: string; name?: string | null; type?: ShotType; stars?: number;
   hidden?: boolean; inferred?: boolean; user?: boolean;
+  /** A vibe-killer: the rhythm broke here (out of the air, double bounce…). `off` = you said it was fine. */
+  flag?: FlowFlag;
+}
+
+export interface FlowFlag {
+  kind: "early" | "late" | "opp_early" | "opp_late" | "baseline_volley" | "marked";
+  label: string; why: string; auto: boolean; off?: boolean;
+}
+
+/** A rally ranked by its best clean stretch: the rally cut at vibe-killers. */
+/** One rally (point): my shots in it in play order, and how many contacts it had (mine + partner's). */
+export interface RallyGroup {
+  key: string;
+  video_id: string;
+  video: string;
+  t0: number;
+  t1: number;
+  n: number;
+  shots: string[];
+}
+
+export interface RankedRally {
+  video_id: string; video: string; t0: number; t1: number; n: number;
+  flags: { t: number; player: "me" | "opp"; name?: string | null; label: string }[];
+  best: { t0: number; t1: number; n: number; score: number; steady: number; quality: number; tempo: number | null };
+  parts: number; shot_id: string; thumb?: string;
+}
+
+/** Every contact in one video, plus your corrections to where rallies split. */
+export interface Strand {
+  video_id: string; video: string; hits: StrandHit[]; point_gap: number;
+  /** Keyed by the later contact's time (t.toFixed(3)): true = new rally starts here, false = same rally. */
+  breaks: Record<string, boolean>;
 }
 
 export interface Version { id: string; name: string; time: number }
@@ -176,6 +220,13 @@ export interface EditorState {
 export interface ProjectSummary {
   id: string; name: string; created: number; modified: number; last_step: "song" | "shots" | "editor" | "rally";
   status: string; n_shots: number; n_exports: number;
+}
+
+/** A footage file some reel uses. `analyzed`: a finished analysis read it. `cached`: its analysis is stored,
+ * so a new reel won't read it again. */
+export interface VideoRecord {
+  path: string; name: string; folder: string; duration: number | null; size: number | null; exists: boolean;
+  analyzed: boolean; cached: boolean; shots: number; reels: { id: string; name: string; status: string; shots: number }[];
 }
 
 export interface Job {
@@ -217,6 +268,8 @@ export const api = {
       "GET", `/api/fs/list?path=${encodeURIComponent(path)}`),
   status: () => req<{ stale: boolean }>("GET", "/api/status"),
   projects: () => req<ProjectSummary[]>("GET", "/api/projects"),
+  videos: (project?: string) =>
+    req<VideoRecord[]>("GET", `/api/videos${project ? `?project=${encodeURIComponent(project)}` : ""}`),
   create: (b: { name: string; footage_dir: string; song_path: string; handed: string; counts?: Record<string, number> }) =>
     req<Project>("POST", "/api/projects", b),
   project: (id: string) => req<Project>("GET", `/api/projects/${id}`),
@@ -230,7 +283,8 @@ export const api = {
     req<Project>("POST", `/api/projects/${id}/section`, b),
   draft: (id: string, b: { mood?: string | null; fresh?: boolean }) => req<Project>("POST", `/api/projects/${id}/draft`, b),
   edit: (id: string, op: string, args: Record<string, unknown>) =>
-    req<{ timeline: Timeline; slot_id?: string; slot_ids?: string[] }>("POST", `/api/projects/${id}/edit`, { op, args }),
+    req<{ timeline: Timeline; slot_id?: string; slot_ids?: string[]; proxies?: Record<string, Shot["proxy"]> }>(
+      "POST", `/api/projects/${id}/edit`, { op, args }),
   undo: (id: string) => req<EditorState>("POST", `/api/projects/${id}/undo`),
   redo: (id: string) => req<EditorState>("POST", `/api/projects/${id}/redo`),
   saveVersion: (id: string, name?: string) => req<EditorState>("POST", `/api/projects/${id}/versions`, { name }),
@@ -239,9 +293,14 @@ export const api = {
   serveMarks: (id: string, sid: string, b: ServeMarksPatch) =>
     req<{ serve_marks: ServeMarks | null; proxy: Shot["proxy"]; timeline: Timeline | null }>("POST", `/api/projects/${id}/shots/${sid}/serve_marks`, b),
   strand: (id: string, sid: string) =>
-    req<{ video_id: string; video: string; hits: StrandHit[]; point_gap: number }>("GET", `/api/projects/${id}/strand?shot=${encodeURIComponent(sid)}`),
-  strandEdit: (id: string, b: { video_id: string; add?: { t: number; player: "me" | "opp" }; remove?: number }) =>
-    req<{ hits: StrandHit[] }>("POST", `/api/projects/${id}/strand/edit`, b),
+    req<Strand>("GET", `/api/projects/${id}/strand?shot=${encodeURIComponent(sid)}`),
+  rallyRank: (id: string) => req<RankedRally[]>("GET", `/api/projects/${id}/rally_rank`),
+  rallySizes: (id: string) => req<Record<string, number>>("GET", `/api/projects/${id}/rally_sizes`),
+  /** Every rally with my shots in it, in play order (follows your strand fixes). */
+  rallyGroups: (id: string) => req<RallyGroup[]>("GET", `/api/projects/${id}/rally_groups`),
+  strandEdit: (id: string, b: { video_id: string; add?: { t: number; player: "me" | "opp" }; remove?: number;
+    break?: { t: number; value: boolean | null }; flow?: { t: number; value: boolean | null } }) =>
+    req<{ hits: StrandHit[]; breaks: Record<string, boolean>; point_gap: number }>("POST", `/api/projects/${id}/strand/edit`, b),
   strandPreview: (id: string, video_id: string, t0: number, t1: number) =>
     req<{ file: string; start: number; end: number }>("POST", `/api/projects/${id}/strand/preview`, { video_id, t0, t1 }),
   rallyClip: (id: string, video_id: string, t0: number, t1: number) =>
@@ -249,7 +308,7 @@ export const api = {
   shotWindow: (id: string, sid: string, after: number) =>
     req<{ proxy: Shot["proxy"]; timeline: Timeline | null }>("POST", `/api/projects/${id}/shots/${sid}/window`, { after }),
   nudges: (id: string, nudges: Record<string, number>) =>
-    req<{ shots: { id: string; nudge: number }[]; timeline: Timeline | null }>("POST", `/api/projects/${id}/nudges`, { nudges }),
+    req<{ shots: { id: string; nudge: number; proxy?: Shot["proxy"] }[]; timeline: Timeline | null }>("POST", `/api/projects/${id}/nudges`, { nudges }),
   patchShot: (id: string, sid: string, b: ShotPatch) =>
     req<Partial<Shot> & { timeline?: Timeline; all?: Pick<Shot, "id" | "stars" | "quality" | "suspect">[]; names?: Record<string, string> }>("PATCH", `/api/projects/${id}/shots/${sid}`, b),
   chat: (id: string, message: string) =>

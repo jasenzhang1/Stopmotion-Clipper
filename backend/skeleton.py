@@ -94,7 +94,7 @@ def serialize(tl: dict) -> str:
     width = max((len(a) for a, c in rows if c), default=0) + 3
     out = [a if not c else a.ljust(width) + c for a, c in rows]
     out.append("")
-    out.append("RALLY   # the drop: a real rally until the point ends")
+    out.append("DROP    # after the drop: your own clips (edit them on the timeline)")
     return "\n".join(out) + "\n"
 
 

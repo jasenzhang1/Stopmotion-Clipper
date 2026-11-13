@@ -127,6 +127,13 @@ input[type="text"]:focus, input[type="number"]:focus, textarea:focus, select:foc
 .project-list { display: grid; gap: 8px; }
 .project-item { display: flex; align-items: center; gap: 12px; padding: 12px; background: var(--panel-2); border-radius: 8px; cursor: pointer; border: 1px solid transparent; }
 .project-item:hover { border-color: var(--line); }
+.video-list { display: grid; gap: 12px; margin: 12px 0; padding: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+.video-item a.small { text-decoration: none; color: var(--accent); font-size: 12px; }
+.video-folder { display: grid; gap: 4px; }
+.video-folder-path { font-size: 12px; word-break: break-all; }
+.video-item { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px 12px; background: var(--panel-2); border-radius: 8px; }
+.video-name { word-break: break-all; }
+.video-status { font-size: 12px; white-space: nowrap; }
 
 .browser { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
 .browser .crumbs { display: flex; gap: 6px; padding: 8px; background: var(--panel-2); align-items: center; flex-wrap: wrap; }
@@ -228,7 +235,7 @@ button.ghost.on { color: var(--accent); }
 .skeleton-help td { padding: 3px 6px 3px 0; vertical-align: top; }
 .skeleton-help code { font-family: ui-monospace, Consolas, monospace; color: var(--accent); white-space: nowrap; }
 @media (max-width: 760px) { .skeleton-body { grid-template-columns: 1fr; } }
-.rally-block { position: absolute; top: 2px; bottom: 2px; border-radius: 4px; background: repeating-linear-gradient(45deg, #3a4a14, #3a4a14 8px, #33420f 8px, #33420f 16px); border: 1px solid var(--accent); color: var(--accent); font-weight: 700; font-size: 12px; display: flex; align-items: center; justify-content: center; cursor: pointer; overflow: hidden; }
+.bar-head.drop-head { color: var(--accent); font-weight: 700; }
 .marker { position: absolute; top: 0; bottom: 0; width: 2px; pointer-events: none; z-index: 4; }
 .marker.drop { background: var(--accent); }
 .marker.head { background: #fff; }
@@ -358,8 +365,14 @@ kbd { font: 11px ui-monospace, monospace; padding: 0 4px; border: 1px solid var(
 .hit.now { border-color: var(--contact); box-shadow: 0 0 0 1px var(--contact); }
 .hit .opp-tag { font-size: 11px; color: var(--muted); }
 .hit .hit-stars { font-size: 9px; color: var(--accent); letter-spacing: -1px; }
-.hit .hit-x { position: absolute; top: -8px; right: -8px; padding: 0 4px; font-size: 10px; opacity: 0; background: var(--panel-2); border-radius: 50%; }
+.hit .hit-x { position: absolute; top: -8px; right: -8px; padding: 0 4px; font-size: 10px; opacity: .35; background: var(--panel-2); border-radius: 50%; }
 .hit:hover .hit-x { opacity: 1; }
+.hit .hit-x:hover { color: var(--danger); border-color: var(--danger); }
+.who-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: middle; flex: none; }
+.hit .who-dot { margin-right: 0; }
+.who-dot.me { background: var(--contact); }
+.who-dot.opp { background: #f2f2f2; border: 1px solid var(--muted); }
+.danger-btn:not(:disabled) { color: var(--danger); border-color: var(--danger); }
 .rally-video { display: flex; justify-content: center; align-items: center; min-height: 120px; }
 .rally-video video { max-height: 52vh; max-width: 100%; border-radius: 10px; background: #000; }
 @media (max-width: 760px) { .rally-step { grid-template-columns: minmax(0, 1fr); grid-template-rows: 220px auto; padding-left: 0; } }
@@ -368,3 +381,44 @@ kbd { font: 11px ui-monospace, monospace; padding: 0 4px; border: 1px solid var(
 
 .slot.snapped-left { box-shadow: inset 3px 0 0 var(--accent), -4px 0 10px rgba(212,245,66,.6); }
 .slot.snapped-right { box-shadow: inset -3px 0 0 var(--accent), 4px 0 10px rgba(212,245,66,.6); }
+
+.rally-fact { font-size: 15px; }
+.rally-fact b { color: var(--accent); font-size: 20px; }
+.rally-tick { position: absolute; top: 3px; bottom: 3px; width: 2px; margin-left: -1px; pointer-events: none; }
+.rally-tick.me { background: var(--contact); }
+.rally-tick.opp { background: #f2f2f2; }
+.rally-tick.anchor { top: 0; bottom: 0; width: 4px; margin-left: -2px; box-shadow: 0 0 6px var(--contact); }
+.rally-video video { cursor: pointer; }
+
+.rally-size { font-size: 11px; color: var(--muted); }
+.rally-size.long { color: var(--accent); font-weight: 600; }
+
+.strand-gap.clickable { cursor: pointer; border-radius: 4px; }
+.strand-gap.clickable:hover { background: var(--panel-2); color: var(--text); }
+.strand-gap.user { text-decoration: underline dotted; }
+
+/* Rally ranking: clean stretches and vibe-killers */
+.rally-tabs button { text-transform: none; letter-spacing: 0; }
+.rank-help { font-size: 11px; padding: 8px 10px; border-bottom: 1px solid var(--line); line-height: 1.4; }
+.rank-item { cursor: pointer; }
+.rank-place { font-size: 11px; color: var(--muted); }
+.rank-score { display: inline-block; min-width: 28px; text-align: center; padding: 1px 6px; border-radius: 999px; font-weight: 700;
+  background: var(--accent); color: var(--accent-ink); font-size: 12px; }
+.rank-meta { font-size: 10px; }
+.rank-fact { font-size: 13px; gap: 8px; }
+.rank-fact .rank-score { font-size: 15px; }
+.hit .vibe { font-size: 9px; color: var(--bh); border: 1px solid rgba(255,138,76,.5); border-radius: 999px; padding: 0 5px; white-space: nowrap; cursor: pointer; }
+.hit .vibe.off { color: var(--muted); border-color: var(--line); text-decoration: line-through; }
+.hit .vibe:hover { background: var(--panel-2); }
+.hit .hit-vibe { position: absolute; top: -8px; left: -8px; padding: 0 4px; font-size: 10px; opacity: 0; background: var(--panel-2); border-radius: 50%; }
+.hit:hover .hit-vibe { opacity: .8; }
+.hit .hit-vibe:hover { color: var(--bh); border-color: var(--bh); opacity: 1; }
+
+/* Rally tab: shots bundled by the rally they were part of */
+.rally-bundle { border-bottom: 2px solid var(--line); }
+.rally-bundle.open { box-shadow: inset 3px 0 0 var(--accent); }
+.rally-bundle-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; padding: 6px 10px 2px; font-size: 11px; cursor: pointer; background: var(--panel-2); }
+.rally-bundle-head:hover { color: var(--accent); }
+.rally-bundle .lib-item { padding-left: 18px; }
+.rally-search { width: 100%; }
+.lib-item.search-hit { box-shadow: inset 0 0 0 2px var(--accent); }

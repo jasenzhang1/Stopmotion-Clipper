@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import chat as chat_mod, config, draft, learning, music as music_mod, project as proj, render
-from . import media, shots as shots_mod
+from . import media, rallies as rallies_mod, shots as shots_mod
 
 app = FastAPI(title="Stopmotion Clipper")
 
@@ -189,6 +189,13 @@ def projects():
     return proj.list_projects()
 
 
+@app.get("/api/videos")
+def videos(project: str | None = None):
+    """Footage files the app has read: all reels', or only those of `project`."""
+    out = proj.list_videos()
+    return [v for v in out if any(r["id"] == project for r in v["reels"])] if project else out
+
+
 @app.post("/api/projects")
 def create_project(body: dict = Body(...)):
     try:
@@ -210,10 +217,14 @@ def create_project(body: dict = Body(...)):
 def get_project(pid: str):
     p = _get(pid)
     tl = p.get("timeline")
-    if tl and any("hit" not in s for b in tl["bars"] for s in b["slots"]):  # saved before clips sat on the grid
+    if tl and (any("hit" not in s for b in tl["bars"] for s in b["slots"])  # saved before clips sat on the grid
+               or tl.get("rally") or not any(b["k"] >= 0 for b in tl["bars"])):  # before the drop had its own bars
         with proj.lock(pid):
             p["timeline"] = draft.recompute(tl, p)
+            _cover_footage(p)
             proj.save(p)
+    elif tl:  # timing rules can improve between versions: show the timeline as it plays now
+        p["timeline"] = draft.recompute(tl, p)
     return _public(p)
 
 
@@ -301,22 +312,60 @@ def set_section(pid: str, body: dict = Body(...)):
         if drop - start < 4 * m["period"]:
             raise HTTPException(400, "Leave at least one bar of build-up before the drop.")
         p["section"] = {"start": start, "end": end, "drop": drop, "suggested": False}
-        if p.get("timeline") and p["status"] == "ready":
-            _regen(p, {}, keep=True, new_seed=False)
+        tl = p.get("timeline")
+        if tl and p["status"] == "ready":
+            before = _snap(p)
+            same_bars = (abs(tl["drop"] - drop) < 1e-6 and [b["k"] for b in tl["bars"] if b["k"] < 0]
+                         == [b["k"] for b in draft.make_bars(m, start, drop)])
+            if same_bars:
+                # Only END moved: the build-up is unchanged; bars after the drop follow END.
+                p["timeline"] = draft.recompute(p["timeline"], p)
+            else:
+                # Surviving bars keep the user's hand edits; only bars new to the section get generated.
+                _regen(p, {}, keep=True, new_seed=False, preserve_bars=True)
+            _cover_footage(p)
+            _record(p, before)  # a section change can be undone from the editor
         proj.save(p)
     return _public(p)
 
 
 # ---------------------------------------------------------------- drafts & edits
 
-def _regen(p: dict, overrides: dict, keep: bool, new_seed: bool) -> None:
+def _regen(p: dict, overrides: dict, keep: bool, new_seed: bool, preserve_bars: bool = False) -> None:
     prof = learning.profile(p.get("mood"))
     proj.refresh_quality(p, prof["quality_weights"])
     old = p.get("timeline")
     seed = None if new_seed or not old else old.get("seed")
     if old:
-        overrides = {"grid": old.get("grid", 8), **overrides}
-    p["timeline"] = draft.generate(p, prof, seed=seed, keep=old if keep else None, overrides=overrides)
+        # After the drop is the user's region: even a fresh draft keeps what's there.
+        overrides = {"grid": old.get("grid", 8), "_prev": old, **overrides}
+    p["timeline"] = draft.generate(p, prof, seed=seed, keep=old if keep else None, overrides=overrides,
+                                    preserve_bars=preserve_bars)
+    _cover_footage(p)
+
+
+def _cover_footage(p: dict) -> dict[str, dict]:
+    """Long clips (e.g. one stretched across the drop): make each shot's preview clip cover all the footage its
+    clips play, so the preview (and the timing, which stays inside the preview clip) doesn't stop short.
+    Returns {shot_id: proxy} for the shots whose preview clip was re-cut."""
+    tl = p.get("timeline")
+    if not tl:
+        return {}
+    shots = {s["id"]: s for s in p["shots"]}
+    changed = {}
+    for b in tl["bars"]:
+        for s in b["slots"]:
+            sh = shots.get(s.get("shot_id"))
+            if not sh or not sh.get("proxy") or "lead" not in s:
+                continue
+            e16 = (b["t1"] - b["t0"]) / 16
+            a = sh["t"] + sh.get("nudge", 0.0) - s["lead"]
+            dur = (s["len"] + float(s.get("ext") or 0.0)) * e16
+            if proj.ensure_proxy(p, sh, a - 0.2, a + dur + 0.3):
+                changed[sh["id"]] = sh["proxy"]
+    if changed:
+        p["timeline"] = draft.recompute(tl, p)
+    return changed
 
 
 @app.post("/api/projects/{pid}/draft")
@@ -356,10 +405,14 @@ def edit(pid: str, body: dict = Body(...)):
                 p["timeline"] = draft.swap_slots(tl, p, a["a"], a["b"])
             elif op == "set_bar_density":
                 p["timeline"] = draft.set_bar_density(tl, p, int(a["k"]), int(a["density"]))
+            elif op == "resize_end":
+                p["timeline"] = draft.resize_end(tl, p, a["slot_id"], float(a["end"]))
             elif op == "set_hit":
-                p["timeline"] = draft.set_hit(tl, p, a["slot_id"], int(a["hit"]))
+                p["timeline"] = draft.set_hit(tl, p, a["slot_id"], float(a["hit"]))
             elif op == "slide_span":
                 p["timeline"], new_id = draft.slide_span(tl, p, a["slot_id"], float(a["start"]))
+            elif op == "resize_start":
+                p["timeline"] = draft.resize_start(tl, p, a["slot_id"], float(a["start"]))
             elif op == "resize_left":
                 p["timeline"], new_id = draft.resize_left(tl, p, a["slot_id"], int(a["pos"]))
             elif op == "resize_slot":
@@ -378,10 +431,12 @@ def edit(pid: str, body: dict = Body(...)):
                 p["timeline"] = draft.set_rally(tl, p, a["rally_id"], a.get("start_hit"))
             elif op in ("unlock_slot", "lock_slot"):
                 draft._find_slot(tl, a["slot_id"])["locked"] = op == "lock_slot"
+            elif op == "slide_spans":
+                p["timeline"], new_ids = draft.slide_spans(tl, p, list(a["ids"]), float(a["delta"]))
             elif op == "move_slots":
                 p["timeline"], new_ids = draft.move_slots(tl, p, list(a["ids"]), int(a["delta"]))
             elif op == "paste_slots":
-                p["timeline"], new_ids = draft.paste_slots(tl, p, list(a["items"]), int(a["at"]))
+                p["timeline"], new_ids = draft.paste_slots(tl, p, list(a["items"]), float(a["at"]))
             elif op == "delete_slots":
                 p["timeline"] = draft.delete_slots(tl, p, list(a["ids"]))
             elif op == "regenerate":
@@ -390,9 +445,11 @@ def edit(pid: str, body: dict = Body(...)):
                 raise HTTPException(400, f"Unknown op {op}")
         except (KeyError, ValueError) as e:
             raise HTTPException(400, str(e))
+        proxies = _cover_footage(p)
         _record(p, before)
         proj.save(p)
-    return {"timeline": p["timeline"], **({"slot_id": new_id} if new_id else {}),
+    return {"timeline": p["timeline"], **({"proxies": proxies} if proxies else {}),
+            **({"slot_id": new_id} if new_id else {}),
             **({"slot_ids": new_ids} if new_ids else {})}
 
 
@@ -463,7 +520,7 @@ def delete_version(pid: str, vid: str):
 # A strand is every contact in one video, in order: my shots (named, graded) and my partner's hits.
 # You can add contacts the app missed or remove wrong ones; a stretch of it becomes the drop rally.
 
-POINT_GAP = 5.5  # seconds without a hit = the point is over
+# Seconds without a hit = the point is over: learning.point_gap() starts at 5.5 and learns from your corrections.
 
 
 def _strand(p: dict, video_id: str) -> list[dict]:
@@ -491,6 +548,44 @@ def _strand(p: dict, video_id: str) -> list[dict]:
     return sorted(hits, key=lambda h: h["t"])
 
 
+def _breaks(p: dict, video_id: str) -> dict[str, bool]:
+    """Your corrections to where rallies split, keyed by the later contact's time ("%.3f"):
+    True = a new rally starts here, False = same rally (despite a long gap)."""
+    return ((p.get("strand_edits") or {}).get(video_id) or {}).get("breaks") or {}
+
+
+def _points(hits: list[dict], breaks: dict[str, bool], gap: float | None = None) -> list[list[dict]]:
+    """Split a strand into rallies: at your breaks, else where the ball didn't come back for `gap` seconds."""
+    gap = learning.point_gap() if gap is None else gap
+    out: list[list[dict]] = []
+    for h in hits:
+        b = breaks.get(f"{h['t']:.3f}")
+        new = not out or b is True or (b is None and h["t"] - out[-1][-1]["t"] > gap)
+        if new:
+            out.append([h])
+        else:
+            out[-1].append(h)
+    return out
+
+
+def _flow(p: dict, video_id: str) -> dict[str, bool]:
+    """Your verdicts on vibe-killers, keyed by the contact's time ("%.3f"): True = it killed the rally,
+    False = it was fine (overrides the automatic flag)."""
+    return ((p.get("strand_edits") or {}).get(video_id) or {}).get("flow") or {}
+
+
+def _assessed(p: dict, video_id: str) -> tuple[list[dict], list[list[dict]]]:
+    """The strand with each contact's vibe-killer flag attached, and its points."""
+    hits = _strand(p, video_id)
+    pts = _points(hits, _breaks(p, video_id))
+    by_id = {s["id"]: s for s in p["shots"]}
+    flow, fallback = _flow(p, video_id), rallies_mod.typical_cycle(pts)
+    for pt in pts:
+        for i, f in rallies_mod.flow_flags(pt, by_id, flow, fallback).items():
+            pt[i]["flag"] = f
+    return hits, pts
+
+
 @app.get("/api/projects/{pid}/strand")
 def strand(pid: str, shot: str):
     p = _get(pid)
@@ -498,12 +593,71 @@ def strand(pid: str, shot: str):
     if not s:
         raise HTTPException(404, "No such shot")
     v = next(v for v in p["videos"] if v["id"] == s["video_id"])
-    return {"video_id": v["id"], "video": v["name"], "hits": _strand(p, v["id"]), "point_gap": POINT_GAP}
+    return {"video_id": v["id"], "video": v["name"], "hits": _assessed(p, v["id"])[0], "point_gap": learning.point_gap(),
+            "breaks": _breaks(p, v["id"])}
+
+
+@app.get("/api/projects/{pid}/rally_rank")
+def rally_rank(pid: str):
+    """Every rally, ranked by its best clean stretch (the rally cut at vibe-killers)."""
+    p = _get(pid)
+    by_id = {s["id"]: s for s in p["shots"]}
+    out = []
+    for v in p["videos"]:
+        for pt in _assessed(p, v["id"])[1]:
+            parts = rallies_mod.clean_stretches(pt, {i: h["flag"] for i, h in enumerate(pt) if h.get("flag")}, by_id)
+            if not parts:
+                continue
+            best = parts[0]
+            sub = pt[best["i0"]:best["i1"] + 1]
+            # Open on my best-graded shot inside the clean part.
+            anchor = max((h for h in sub if h.get("shot_id") in by_id),
+                         key=lambda h: (by_id[h["shot_id"]].get("stars") or 0, by_id[h["shot_id"]].get("quality") or 0),
+                         default=None)
+            if not anchor:
+                continue
+            flags = [{"t": h["t"], "player": h["player"], "name": h.get("name"), "label": h["flag"]["label"]}
+                     for h in pt if h.get("flag") and not h["flag"].get("off")]
+            out.append({"video_id": v["id"], "video": v["name"], "t0": pt[0]["t"], "t1": pt[-1]["t"], "n": len(pt),
+                        "flags": flags, "best": {k: best[k] for k in ("t0", "t1", "n", "score", "steady", "quality", "tempo")},
+                        "parts": len(parts), "shot_id": anchor["shot_id"], "thumb": by_id[anchor["shot_id"]].get("thumb")})
+    out.sort(key=lambda r: -r["best"]["score"])
+    return out
+
+
+@app.get("/api/projects/{pid}/rally_sizes")
+def rally_sizes(pid: str):
+    """For each of my shots: how many contacts (mine + partner's) the rally it was part of had."""
+    p = _get(pid)
+    out: dict[str, int] = {}
+    for v in p["videos"]:
+        for group in _points(_strand(p, v["id"]), _breaks(p, v["id"])):
+            for g in group:
+                if g.get("shot_id"):
+                    out[g["shot_id"]] = len(group)
+    return out
+
+
+@app.get("/api/projects/{pid}/rally_groups")
+def rally_groups(pid: str):
+    """Every rally (point) with my shots in it, in the order they were played: which video, when, how many
+    contacts (mine + partner's), and my shots in it in order. Follows your fixes to the strand and its breaks."""
+    p = _get(pid)
+    out = []
+    for v in p["videos"]:
+        for group in _points(_strand(p, v["id"]), _breaks(p, v["id"])):
+            mine = [g["shot_id"] for g in group if g.get("shot_id")]
+            if mine:
+                out.append({"key": f"{v['id']}:{group[0]['t']:.3f}", "video_id": v["id"], "video": v["name"],
+                            "t0": group[0]["t"], "t1": group[-1]["t"], "n": len(group), "shots": mine})
+    return out
 
 
 @app.post("/api/projects/{pid}/strand/edit")
 def strand_edit(pid: str, body: dict = Body(...)):
-    """{"video_id", "add": {"t", "player": "me"|"opp"}} or {"video_id", "remove": t}."""
+    """{"video_id", "add": {"t", "player": "me"|"opp"}}, {"video_id", "remove": t} or
+    {"video_id", "break": {"t": later contact's time, "value": true (new rally) | false (same rally) | null (auto)}} or
+    {"video_id", "flow": {"t": contact's time, "value": true (vibe-killer) | false (fine) | null (auto)}}."""
     p = _get(pid)
     vid = body["video_id"]
     with proj.lock(pid):
@@ -513,6 +667,27 @@ def strand_edit(pid: str, body: dict = Body(...)):
             t = float(a["t"])
             e["remove"] = [r for r in e["remove"] if abs(r - t) >= 0.05]
             e["add"].append({"t": round(t, 4), "player": "opp" if a.get("player") == "opp" else "me"})
+        if body.get("break"):
+            key = f"{float(body['break']['t']):.3f}"
+            val = body["break"].get("value")
+            br = e.setdefault("breaks", {})
+            if val is None:
+                br.pop(key, None)
+            else:
+                br[key] = bool(val)
+            # Learn from it: how long the pause before this contact was, and whether the rally ended there.
+            hits = _strand(p, vid)
+            i = next((j for j, h in enumerate(hits) if f"{h['t']:.3f}" == key), None)
+            gap = hits[i]["t"] - hits[i - 1]["t"] if i else None
+            learning.record_break(f"{pid}/{vid}/{key}", gap, None if val is None else bool(val))
+        if body.get("flow"):
+            key = f"{float(body['flow']['t']):.3f}"
+            val = body["flow"].get("value")
+            fl = e.setdefault("flow", {})
+            if val is None:
+                fl.pop(key, None)
+            else:
+                fl[key] = bool(val)
         if body.get("remove") is not None:
             t = float(body["remove"])
             before = len(e["add"])
@@ -520,7 +695,7 @@ def strand_edit(pid: str, body: dict = Body(...)):
             if len(e["add"]) == before:  # a detected hit: remember to leave it out
                 e["remove"].append(round(t, 4))
         proj.save(p)
-    return {"hits": _strand(p, vid)}
+    return {"hits": _assessed(p, vid)[0], "breaks": _breaks(p, vid), "point_gap": learning.point_gap()}
 
 
 @app.post("/api/projects/{pid}/strand/preview")
@@ -630,11 +805,12 @@ def nudges(pid: str, body: dict = Body(...)):
         by_id = {s["id"]: s for s in p["shots"]}
         for sid, v in (body.get("nudges") or {}).items():
             if sid in by_id:
+                _cover_contact(p, by_id[sid], float(v or 0))
                 by_id[sid]["nudge"] = _clamp_nudge(p, by_id[sid], float(v or 0))
         if p.get("timeline"):
             p["timeline"] = draft.recompute(p["timeline"], p)
         proj.save(p)
-        return {"shots": [{"id": sid, "nudge": by_id[sid].get("nudge")} for sid in body.get("nudges") or {} if sid in by_id],
+        return {"shots": [{"id": sid, "nudge": by_id[sid].get("nudge"), "proxy": by_id[sid].get("proxy")} for sid in body.get("nudges") or {} if sid in by_id],
                 "timeline": p.get("timeline")}
 
 
@@ -704,15 +880,22 @@ def patch_shot(pid: str, sid: str, body: dict = Body(...)):
 
 
 def _clamp_nudge(p: dict, s: dict, v: float) -> float:
-    """The contact can be anywhere in the shot's preview clip."""
-    lo, hi = s["proxy"]["start"] - s["t"], proj.proxy_end(s) - s["t"]
-    return round(max(lo, min(hi, v)), 4)
+    """The contact can be any frame of the source video."""
+    vdur = next(v for v in p["videos"] if v["id"] == s["video_id"]).get("duration") or float("inf")
+    return round(max(-s["t"], min(vdur - s["t"], v)), 4)
 
 
 def _cover_contact(p: dict, s: dict, nudge: float) -> None:
-    """A contact near the edge of the preview clip: re-cut it so a clip around the contact still fits."""
+    """Re-cut the shot's preview clip if needed so it covers the new contact and all the footage every reel clip
+    using this shot plays around it (a whole-note clip plays a lot), so the preview shows what will export."""
     c = s["t"] + nudge
-    proj.ensure_proxy(p, s, c - 1.0, c + config.SHOT_PROXY_WINDOW[1])
+    lo, hi = c - 1.0, c + config.SHOT_PROXY_WINDOW[1]
+    for b in (p.get("timeline") or {}).get("bars", []):
+        for slot in b["slots"]:
+            if slot.get("shot_id") == s["id"] and "lead" in slot and "start" in slot:
+                src = c - slot["lead"]
+                lo, hi = min(lo, src - 0.1), max(hi, src + (slot["end"] - slot["start"]) + 0.1)
+    proj.ensure_proxy(p, s, lo, hi)
 
 
 @app.post("/api/projects/{pid}/chat")
@@ -785,7 +968,7 @@ if config.FRONTEND_DIST.exists():
         f = config.FRONTEND_DIST / full
         if full and f.is_file():
             return FileResponse(f)
-        return FileResponse(config.FRONTEND_DIST / "index.html")
+        return FileResponse(config.FRONTEND_DIST / "index.html", headers={"Cache-Control": "no-cache"})
 
 
 def main():

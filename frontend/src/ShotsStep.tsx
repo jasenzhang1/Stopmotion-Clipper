@@ -1,5 +1,6 @@
 import { useMemo, useRef, useState } from "react";
 import LoadMore from "./LoadMore";
+import VideosPanel from "./VideosPanel";
 import { api, COMPLAINTS, fileUrl, matchFilter, Project, Shot, ShotPatch, ShotType, TYPE_CODE, TYPE_LABEL } from "./api";
 
 export function Stars({ value, onChange }: { value: number; onChange?: (n: number) => void }) {
@@ -101,6 +102,7 @@ export default function ShotsStep({ project, setProject, onNext }: {
 }) {
   const [filter, setFilter] = useState("all");
   const [sort, setSort] = useState<"stars" | "time">("stars");
+  const [showVideos, setShowVideos] = useState(false);
   const update = useShotUpdater(project, setProject);
   const shots = useMemo(() => {
     const vids = Object.fromEntries(project.videos.map((v, i) => [v.id, i]));
@@ -114,10 +116,15 @@ export default function ShotsStep({ project, setProject, onNext }: {
     <div className="shots-step">
       <div className="row" style={{ flexWrap: "wrap" }}>
         <h2 style={{ margin: 0 }}>Your shots</h2>
-        {st && <span className="muted">Showing your best {project.shots.length} of {st.shots} shots · {st.rallies} rallies from {st.videos} videos</span>}
+        {st && <span className="muted">Showing your best {project.shots.length} of {st.shots} shots · {st.rallies} rallies from</span>}
+        <button className={`small ${showVideos ? "on" : ""}`} onClick={() => setShowVideos(!showVideos)}
+          title="See which video files this reel read">
+          {project.videos.length} videos {showVideos ? "▴" : "▾"}
+        </button>
         <span className="spacer" />
         <button className="primary" onClick={onNext}>Next: build the reel →</button>
       </div>
+      {showVideos && <VideosPanel project={project} />}
       {st && !st.pose_used && (
         <p className="error">No players were detected in the video frames, so shots were found from sound only and are unlabeled.</p>
       )}

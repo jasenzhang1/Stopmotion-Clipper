@@ -15,8 +15,8 @@ How a reel is built:
 eighth notes). Every clip is a split-second of one of the player's shots, cut so racket contact lands exactly \
 on its beat. Slot ids look like "b-3s2" = bar k=-3 (3 bars before the drop), slot index 2.
 - Bars are identified by k: -1 is the last bar before the drop, -2 the one before it, and so on.
-- Drop: a real rally plays at normal speed starting on the drop, and the reel ends a split second after the \
-point ends. A rally can start mid-way (start_hit) if the latter part is more exciting.
+- After the drop (bars k=0, 1, ...) is the player's own region: they place and stretch clips there themselves \
+(often one long clip of a rally). Don't change those bars unless asked.
 - Shot types: forehand, backhand, fh_slice, bh_slice (slices count as forehands/backhands, letters F/B), fh_volley, bh_volley, approach, serve, overhead. Stars (1-5) rate how good \
 the shot looks (racket speed, swing size, clean contact, visibility).
 - Every clip has a label like F3 (F forehand, B backhand, V volley, A approach, S serve/overhead, U unlabeled). A label names one specific clip across the whole reel: the same label twice means the exact same clip is repeated. Repeat a clip only to make a point (e.g. the music repeats the same note); otherwise keep clips unique.
@@ -49,8 +49,8 @@ TOOLS = [
                                              "timeline's skeleton field). Must have one line per bar.",
      "input_schema": {"type": "object", "properties": {"text": {"type": "string"}},
                       "required": ["text"], "additionalProperties": False}},
-    {"name": "set_rally", "description": "Choose the rally that plays on the drop, and optionally which hit "
-                                         "(0-based index into its hits) it starts from. Omit start_hit to auto-pick.",
+    {"name": "set_rally", "description": "Only when the player names one: put that rally after the drop as one long "
+                                         "clip (replacing what's there), from hit start_hit (0-based, default 0).",
      "input_schema": {"type": "object", "properties": {
          "rally_id": {"type": "string"}, "start_hit": {"type": "integer"}},
          "required": ["rally_id"], "additionalProperties": False}},

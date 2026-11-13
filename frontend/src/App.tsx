@@ -6,6 +6,7 @@ import ShotsStep from "./ShotsStep";
 import Editor from "./Editor";
 import ProgressBar from "./Progress";
 import RallyStep from "./RallyStep";
+import ErrorBoundary from "./ErrorBoundary";
 
 type Step = "song" | "shots" | "editor" | "rally";
 
@@ -43,6 +44,7 @@ export default function App() {
   const [stopping, setStopping] = useState(false);
   const [runs, setRuns] = useState(0); // bumped to follow a newly started analysis job
   const [savedAt, setSavedAt] = useState(0);
+  const [exportReq, setExportReq] = useState(0); // bumped by the top bar's Export button
   // The backend changed since the server started: tell the user to restart run.bat (checked every 20 s).
   const [stale, setStale] = useState(false);
   useEffect(() => {
@@ -161,6 +163,10 @@ export default function App() {
           </>
         )}
         <div className="spacer" />
+        {p && ready && p.timeline && (
+          <button className="primary small" onClick={() => { setExportReq((n) => n + 1); go(p.id, "editor"); }}
+            title="Render the reel as a video: your footage with the song as its only sound">Export ▸</button>
+        )}
         {p && savedAt > 0 && <span className="muted">Saved</span>}
         {stale && <span className="error" title="The app was updated. Close the run.bat window and double-click run.bat again.">⚠ Restart run.bat to load the latest changes</span>}
         {err && <span className="error" onClick={() => setErr(null)} title="Dismiss">{err}</span>}
@@ -185,6 +191,7 @@ export default function App() {
         </div>
       )}
       <div className="main">
+        <ErrorBoundary resetKey={`${route.pid}/${route.step}`}>
         {!route.pid && meta && <Home meta={meta} onOpen={(id, step) => go(id, step ?? "song")} />}
         {p && route.step === "song" && (
           <SongStep project={p} onSaved={setProject} onNext={() => go(p.id, "shots")} ready={ready} />
@@ -196,11 +203,12 @@ export default function App() {
           <RallyStep project={p} setProject={setProject} onDone={() => go(p.id, "editor")} />
         )}
         {p && ready && route.step === "editor" && meta && (
-          <Editor project={p} setProject={setProject} meta={meta} />
+          <Editor project={p} setProject={setProject} meta={meta} exportReq={exportReq} />
         )}
         {p && !ready && route.step !== "song" && (
           <div className="home"><div className="card">{notStarted ? "Footage hasn't been analyzed yet." : "Still analyzing footage…"}</div></div>
         )}
+        </ErrorBoundary>
       </div>
     </div>
   );

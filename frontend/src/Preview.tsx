@@ -19,7 +19,14 @@ export function buildItems(p: Project, tl: Timeline): Item[] {
       });
     }
   }
-  if (tl.rally) {
+  if (tl.rally?.shot_id && tl.rally.proxy && tl.rally.end > tl.rally.start) {
+    const sh = shots[tl.rally.shot_id];
+    items.push({
+      key: `rally-${tl.rally.shot_id}`, url: fileUrl(p.id, tl.rally.proxy.file), offset: Math.max(0, tl.rally.src_start - tl.rally.proxy.start),
+      start: tl.rally.start, end: tl.rally.end, label: `DROP · ${sh ? sh.name ?? TYPE_CODE[sh.type] : "footage"}`,
+      poster: sh ? fileUrl(p.id, sh.thumb) : undefined,
+    });
+  } else if (tl.rally) {
     const r = p.rallies.find((x) => x.id === tl.rally!.rally_id);
     if (r) {
       items.push({

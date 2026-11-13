@@ -54,7 +54,7 @@ export function RallyPicker({ project, setProject, onClose, onPick }: {
         <div className="row"><h3>Choose the drop rally</h3><span className="spacer" /><button onClick={onClose}>Close</button></div>
         {rallies.map((r) => (
           <RallyRow key={r.id} project={project} r={r} current={cur?.rally_id === r.id}
-            startHit={cur?.rally_id === r.id ? cur.start_hit : null}
+            startHit={cur?.rally_id === r.id ? cur.start_hit ?? null : null}
             onUse={(s) => onPick(r.id, s)} />
         ))}
         {!rallies.length && <p>No rallies were found in this footage.</p>}
